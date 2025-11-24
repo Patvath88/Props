@@ -23,7 +23,6 @@ TODAY = dt.date.today()
 
 # --- Utils ---
 def _min_str_to_float(m: Optional[str | int | float]) -> float:
-    """Parse 'MM:SS' to minutes; return 0.0 on bad input. Avoids crashes on messy feeds."""
     if m in (None, "", np.nan):
         return 0.0
     if isinstance(m, (int, float)):
@@ -39,7 +38,6 @@ def _min_str_to_float(m: Optional[str | int | float]) -> float:
 
 
 def _rolling_feature(series: pd.Series, window: int) -> pd.Series:
-    """Trailing mean before game. Shift prevents label leakage."""
     return series.shift(1).rolling(window=window, min_periods=1).mean()
 
 
@@ -58,7 +56,6 @@ def _std_err(residuals: np.ndarray) -> float:
 
 
 def _ci80(pred: float, se: float, n: int) -> Tuple[float, float]:
-    """Approximate 80% CI; guarded for small samples."""
     if not np.isfinite(se) or n <= 5:
         return (float("nan"), float("nan"))
     z = 1.2816
@@ -74,14 +71,13 @@ class BdlClient:
         self._attach_auth_headers()
 
     def _attach_auth_headers(self) -> None:
-        """Attach common auth headers. Kept broad to be compatible with provider setups."""
+        # Why: support provider variations without exposing the key value.
         if not self.api_key:
             return
-        # Different providers use different headers; we set a few safely.
         self.sess.headers.update(
             {
-                "Authorization": f"Bearer {self.api_key}",  # common pattern
-                "X-API-Key": self.api_key,                  # fallback pattern
+                "Authorization": f"Bearer {self.api_key}",
+                "X-API-Key": self.api_key,
                 "User-Agent": "NBA-Props-Projector/1.0 (+streamlit)",
             }
         )
@@ -92,7 +88,6 @@ class BdlClient:
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
-            # Avoid echoing secrets.
             raise RuntimeError(f"HTTP error calling {path}: {e.response.status_code} {e.response.text[:200]}") from e
         except Exception as e:
             raise RuntimeError(f"Request error calling {path}: {e}") from e
@@ -153,7 +148,7 @@ class BdlClient:
         return pd.concat(frames, ignore_index=True)
 
 
-# --- Cache wrappers (scope cache by API key to avoid cross-user bleed) ---
+# --- Cache wrappers (cache keyed by API key) ---
 @st.cache_data(show_spinner=False)
 def cached_teams_df(api_key: str) -> pd.DataFrame:
     return BdlClient(api_key).all_teams()
@@ -318,7 +313,6 @@ def prepare_model_table(df: pd.DataFrame, prop: str) -> Tuple[pd.DataFrame, pd.S
 
 
 def train_ridge_or_wma(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Pipeline], float, np.ndarray]:
-    """Ridge for n>=10, otherwise weighted moving average. Keeps small-sample behavior stable."""
     n = len(X)
     if n < 10:
         if n == 0:
@@ -330,7 +324,7 @@ def train_ridge_or_wma(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Pipeline
     model.fit(X, y)
     yhat = model.predict(X)
     residuals = y.values - yhat
-    return model, float(yhat[-1]), residuals  # last in-sample approx is stable enough for CI calc
+    return model, float(yhat[-1]), residuals  # last in-sample approximation
 
 
 def home_away_multiplier(df: pd.DataFrame, prop: str) -> Optional[float]:
@@ -353,7 +347,6 @@ def project_next(
     beta: float,
     home_mult: Optional[float],
 ) -> float:
-    """Simple, explainable scaling on top of model/WMA prediction."""
     pred = float(model.predict(X_latest)[0]) if model is not None else base_pred
     if home_mult and np.isfinite(home_mult):
         pred *= float(home_mult)
@@ -367,17 +360,16 @@ def project_next(
 st.set_page_config(page_title="NBA Player Props Projector", layout="wide")
 st.title("🏀 NBA Player Props Projector")
 
-# Secure API key handling
+# Secure API key handling (sidebar + secrets + env)
 default_key = st.secrets.get("balldontlie_api_key", os.getenv("BALDONTLIE_API_KEY", ""))
 api_key = st.sidebar.text_input(
     "balldontlie API Key (All-Star tier)",
     value=default_key,
     type="password",
-    help="Stored only in this session. You can also set st.secrets['balldontlie_api_key'] or env BALDONTLIE_API_KEY.",
+    help="Use st.secrets['balldontlie_api_key'] or env BALDONTLIE_API_KEY for unattended runs.",
 )
 if not api_key:
     st.warning("Enter your balldontlie API key to unlock full stats.")
-    # Continue; some endpoints may still work if public.
 
 st.sidebar.header("Controls")
 season_current = TODAY.year if TODAY.month >= 10 else TODAY.year - 1
