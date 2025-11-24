@@ -9,7 +9,7 @@ Run:
 Env:
   export BALLDONTLIE_API_KEY="YOUR_PRO_KEY"  # or paste in sidebar
 """
-from __future__ import annotations
+
 from balldontlie_client import APIConfig, BallDontLieClient
 
 import os
