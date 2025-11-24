@@ -1,8 +1,8 @@
 # file: streamlit_app.py
 from __future__ import annotations
 
-import importlib
 import os
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
@@ -11,21 +11,12 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# Feature/ML modules (assumed present)
-from features import (
-    build_supervised_rows,
-    normalize_stats_rows,
-    rolling_features,
-    attach_season_averages,
-)
-from modeling import TrainedModel, predict_one, train_regressor
-
-# -------------------------
-# Import/Client Resolver
-# -------------------------
+# =========================
+# Inline BallDontLie Client
+# =========================
 
 class BalldontlieError(Exception):
-    """HTTP or client error from BallDontLie API."""
+    pass
 
 def _expand_params(params: Optional[Dict[str, Any]]) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
@@ -44,27 +35,17 @@ def _expand_params(params: Optional[Dict[str, Any]]) -> List[Tuple[str, str]]:
             out.append((k, str(v)))
     return out
 
-class _InlineBalldontlieClient:
-    """
-    Minimal inline fallback client so Streamlit never crashes if your SDK import breaks.
-    Implements only the endpoints used by this app.
-    """
-    def __init__(
-        self,
-        api_key: str,
-        *,
-        base_url: str = "https://api.balldontlie.io",
-        timeout: float = 20.0,
-    ) -> None:
+class BDLClient:
+    """Minimal client for endpoints used in this app."""
+    def __init__(self, api_key: str, base_url: str = "https://api.balldontlie.io", timeout: float = 20.0) -> None:
         if not api_key:
-            raise ValueError("API key required")
+            raise ValueError("API key required (BALLDONTLIE_API_KEY)")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.s = requests.Session()
-        # API expects raw key in Authorization (no 'Bearer ')
+        # Why: API expects raw key, no 'Bearer '
         self.s.headers.update({"Authorization": api_key, "Accept": "application/json"})
 
-    # --- low-level ---
     def _request(self, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.base_url}{path}"
         try:
@@ -86,14 +67,13 @@ class _InlineBalldontlieClient:
         while True:
             page = self._request(path, params=q)
             yield page
-            meta = page.get("meta") or {}
-            nxt = meta.get("next_cursor")
+            nxt = (page.get("meta") or {}).get("next_cursor")
             if not nxt:
                 break
             q["cursor"] = nxt
 
-    # --- endpoints used by app ---
-    def games_list(self, *, dates: Optional[List[str]] = None, per_page: int = 25, cursor: Optional[Union[int,str]] = None, **_) :
+    # --- endpoints used ---
+    def games_list(self, *, dates: Optional[List[str]] = None, per_page: int = 25, cursor: Optional[Union[int,str]] = None, **_):
         params: Dict[str, Any] = {}
         if dates: params["dates"] = dates
         return self._paginate("/v1/games", params=params, per_page=per_page, cursor=cursor)
@@ -126,38 +106,182 @@ class _InlineBalldontlieClient:
     def season_averages(self, *, category: str, season: int, season_type: str, type: str, player_ids: Optional[List[int]] = None):
         params: Dict[str, Any] = {"season": season, "season_type": season_type, "type": type}
         if player_ids: params["player_ids"] = player_ids
-        # NOTE: some docs show /v1/season_averages/{category}
         return self._request(f"/v1/season_averages/{category}", params=params)
 
-def _resolve_bdl_client_class() -> Tuple[Type[Any], str]:
-    """
-    Try multiple class names/modules. On failure, return inline fallback.
-    Returns (ClientClass, info_message).
-    """
-    candidates = [
-        ("balldontlie_client", "BalldontlieClient"),
-        ("balldontlie_client", "BallDontLieClient"),
-        ("balldontlie", "BalldontlieClient"),
-        ("balldontlie", "Client"),
-    ]
-    for mod_name, cls_name in candidates:
+# ===================
+# Inline Feature Layer
+# ===================
+
+STAT_COLS = ["pts","reb","ast","blk","stl","fg3a","fg3m","fga","fgm","fta","ftm","turnover","min"]
+
+def _parse_min(val: Any) -> float:
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return np.nan
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val)
+    if ":" in s:
         try:
-            mod = importlib.import_module(mod_name)
-            cls = getattr(mod, cls_name)
-            return cls, f"Using {mod_name}.{cls_name}"
+            mm, ss = s.split(":")
+            return float(int(mm) + int(ss) / 60.0)
         except Exception:
-            continue
-    return _InlineBalldontlieClient, "Using inline fallback client (could not import your SDK)."
+            return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
 
-# Optional mock
+def normalize_stats_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    flat: List[Dict[str, Any]] = []
+    for r in rows:
+        g = r.get("game", {})
+        team = r.get("team", {})
+        out = {k: r.get(k) for k in STAT_COLS}
+        out.update({
+            "game_id": g.get("id"),
+            "game_date": g.get("date"),
+            "season": g.get("season"),
+            "postseason": g.get("postseason"),
+            "home_team_id": g.get("home_team_id"),
+            "visitor_team_id": g.get("visitor_team_id"),
+            "team_id": team.get("id"),
+            "player_id": r.get("player", {}).get("id", r.get("player_id")),
+        })
+        flat.append(out)
+    df = pd.DataFrame(flat)
+    if "min" in df:
+        df["min"] = df["min"].apply(_parse_min)
+    return df
+
+def rolling_features(df: pd.DataFrame, window: int) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df.sort_values(["player_id", "game_date"]).copy()
+    feats: Dict[str, pd.Series] = {}
+    for col in ["pts","reb","ast","min","fga","fta","fg3a","fgm","fg3m","ftm","turnover"]:
+        if col in df:
+            feats[f"{col}_r{window}"] = (
+                df.groupby("player_id")[col].transform(lambda s: s.shift(1).rolling(window=window, min_periods=window).mean())
+            )
+    out = pd.concat([df, pd.DataFrame(feats)], axis=1)
+    need = [c for c in out.columns if c.endswith(f"_r{window}")]
+    out = out.dropna(subset=need)
+    return out
+
+def attach_season_averages(out: pd.DataFrame, season_avgs: pd.DataFrame) -> pd.DataFrame:
+    if season_avgs.empty or out.empty:
+        return out
+    sa = season_avgs.add_prefix("sa_")
+    sa = sa.rename(columns={"sa_player_id": "player_id"})
+    return out.merge(sa, on="player_id", how="left")
+
+def build_supervised_rows(
+    df: pd.DataFrame,
+    window: int,
+    target: str,
+    season_avgs: Optional[pd.DataFrame] = None,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    feat_df = rolling_features(df, window)
+    if season_avgs is not None:
+        feat_df = attach_season_averages(feat_df, season_avgs)
+    y = feat_df[target].astype(float)
+    # Drop raw stat columns from features
+    drop_stats = [c for c in ["pts","reb","ast"] if c in feat_df]
+    X = feat_df.drop(columns=drop_stats)
+    keep_ids = ["player_id","game_id","game_date","team_id","season","postseason"]
+    id_cols = [c for c in keep_ids if c in feat_df]
+    X = pd.concat([X.drop(columns=[c for c in id_cols if c in X]), feat_df[id_cols]], axis=1)
+    return X, y
+
+# ===================
+# Inline Modeling
+# ===================
+
 try:
-    from mock_client import MockBalldontlieClient  # type: ignore
-except Exception:  # pragma: no cover
-    MockBalldontlieClient = None  # type: ignore
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import Ridge
+    from sklearn.metrics import mean_absolute_error
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    _HAS_SK = True
+except Exception:
+    _HAS_SK = False
 
-# -------------------------
-# Streamlit Config
-# -------------------------
+try:
+    from xgboost import XGBRegressor  # type: ignore
+    _HAS_XGB = True
+except Exception:
+    _HAS_XGB = False
+
+@dataclass
+class TrainedModel:
+    algo: str
+    feature_cols: List[str]
+    target: str
+    window: int
+    metrics: Dict[str, float]
+    # store either sklearn Pipeline or simple tuple for fallback
+    model: Any
+
+def _train_ridge_numpy(X: pd.DataFrame, y: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+    """Very small ridge fallback with standardization."""
+    Xn = X.fillna(X.median(numeric_only=True)).to_numpy(dtype=float)
+    mu = Xn.mean(axis=0)
+    sd = Xn.std(axis=0)
+    sd[sd == 0] = 1.0
+    Xs = (Xn - mu) / sd
+    lam = 2.0
+    w = np.linalg.pinv(Xs.T @ Xs + lam * np.eye(Xs.shape[1])) @ Xs.T @ y.to_numpy(dtype=float)
+    return w, np.vstack([mu, sd])
+
+def _predict_ridge_numpy(model_tuple: Tuple[np.ndarray, np.ndarray], Xrow: pd.DataFrame) -> float:
+    w, stats = model_tuple
+    mu, sd = stats
+    x = Xrow.fillna(Xrow.median(numeric_only=True)).to_numpy(dtype=float)
+    x = (x - mu) / sd
+    return float(x @ w)[0]
+
+def train_regressor(X: pd.DataFrame, y: pd.Series, *, algo: str = "ridge", random_state: int = 42) -> TrainedModel:
+    feat_cols = [c for c in X.columns if c not in {"player_id","game_id","game_date","team_id","season","postseason"}]
+    if algo == "xgb" and _HAS_XGB and _HAS_SK:
+        reg = XGBRegressor(
+            n_estimators=300, max_depth=4, learning_rate=0.05,
+            subsample=0.9, colsample_bytree=0.9, random_state=random_state, n_jobs=0, reg_lambda=1.0
+        )
+        pre = ColumnTransformer([("num", Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]), feat_cols)], remainder="drop")
+        pipe = Pipeline([("pre", pre), ("reg", reg)])
+        pipe.fit(X[feat_cols], y)
+        yhat = pipe.predict(X[feat_cols])
+        mae = float(np.mean(np.abs(yhat - y.to_numpy())))
+        return TrainedModel(algo="xgb", feature_cols=feat_cols, target=y.name or "pts", window=-1, metrics={"mae_in_sample": mae}, model=pipe)
+
+    if _HAS_SK:
+        pre = ColumnTransformer([("num", Pipeline([("impute", SimpleImputer(strategy="median")), ("scale", StandardScaler())]), feat_cols)], remainder="drop")
+        pipe = Pipeline([("pre", pre), ("reg", Ridge(alpha=2.0, random_state=random_state))])
+        pipe.fit(X[feat_cols], y)
+        yhat = pipe.predict(X[feat_cols])
+        mae = float(np.mean(np.abs(yhat - y.to_numpy())))
+        return TrainedModel(algo="ridge", feature_cols=feat_cols, target=y.name or "pts", window=-1, metrics={"mae_in_sample": mae}, model=pipe)
+
+    # NumPy fallback
+    w, stats = _train_ridge_numpy(X[feat_cols], y)
+    # in-sample MAE
+    mae = float(np.mean(np.abs([_predict_ridge_numpy((w, stats), X[feat_cols].iloc[[i]]) - y.iloc[i] for i in range(len(y))])))
+    return TrainedModel(algo="ridge_np", feature_cols=feat_cols, target=y.name or "pts", window=-1, metrics={"mae_in_sample": mae}, model=(w, stats))
+
+def predict_one(tr: TrainedModel, row: pd.DataFrame) -> float:
+    missing = sorted(set(tr.feature_cols) - set(row.columns))
+    if missing:
+        raise ValueError(f"Missing features: {missing[:8]}")
+    if isinstance(tr.model, tuple):
+        return _predict_ridge_numpy(tr.model, row[tr.feature_cols].iloc[[0]])
+    else:
+        return float(tr.model.predict(row[tr.feature_cols])[0])
+
+# =========================
+# Streamlit: Config/Helpers
+# =========================
 
 st.set_page_config(page_title="NBA Player Prop Prediction Dashboard", layout="wide")
 
@@ -168,27 +292,13 @@ def _get_api_key() -> str:
         key = None
     return key or os.getenv("BALLDONTLIE_API_KEY", "")
 
-def _use_mock() -> bool:
-    try:
-        if st.secrets.get("MOCK", False):  # type: ignore[attr-defined]
-            return True
-    except Exception:
-        pass
-    return os.getenv("BALD_MOCK", "0") == "1"
-
 @st.cache_resource(show_spinner=False)
-def get_client():
-    if _use_mock() and MockBalldontlieClient is not None:
-        return MockBalldontlieClient()
-    ClientClass, _msg = _resolve_bdl_client_class()
-    api_key = _get_api_key()
-    if not api_key:
-        st.stop()
-    return ClientClass(api_key)
+def get_client() -> BDLClient:
+    return BDLClient(_get_api_key())
 
-# -------------------------
-# Cached Data Accessors
-# -------------------------
+# ---------------
+# Cached loaders
+# ---------------
 
 @st.cache_data(show_spinner=False, ttl=300)
 def df_games(d: str) -> pd.DataFrame:
@@ -255,9 +365,9 @@ def df_season_averages(player_ids: List[int], season: int) -> pd.DataFrame:
         df["player_id"] = df["player"].apply(lambda x: x.get("id") if isinstance(x, dict) else None)
     return df
 
-# -------------------------
-# ML Training Cache
-# -------------------------
+# ----------------------
+# Training cache wrapper
+# ----------------------
 
 @st.cache_resource(show_spinner=False)
 def train_player_model(player_id: int, season: int, target: str, window: int, algo: str) -> TrainedModel:
@@ -272,46 +382,28 @@ def train_player_model(player_id: int, season: int, target: str, window: int, al
     model.window = window
     return model
 
-# -------------------------
-# UI
-# -------------------------
+# =========
+# The UI
+# =========
 
 st.title("NBA Player Prop Prediction Dashboard")
 
-# Mode / key guards
-mock_mode = _use_mock()
 api_key_present = bool(_get_api_key())
-if not api_key_present and not mock_mode:
-    st.info("Add API key to `st.secrets['BALLDONTLIE_API_KEY']` or set `BALD_MOCK=1` for demo.")
+if not api_key_present:
+    st.info("Set `BALLDONTLIE_API_KEY` in environment or Streamlit secrets.")
     st.stop()
 
 with st.sidebar:
-    # Show which client got resolved
-    if mock_mode and MockBalldontlieClient is not None:
-        st.write("**Mode:** Mock")
-    else:
-        _, msg = _resolve_bdl_client_class()
-        st.write(f"**Mode:** Live")
-        st.caption(msg)
-
     today = date.today()
-    pick_date = st.date_input(
-        "Slate date",
-        today,
-        min_value=today - timedelta(days=60),
-        max_value=today + timedelta(days=60),
-    )
+    pick_date = st.date_input("Slate date", today, min_value=today - timedelta(days=60), max_value=today + timedelta(days=60))
     default_season = today.year if today.month >= 8 else today.year - 1
     season = st.number_input("Season", min_value=2000, max_value=2100, value=default_season, step=1)
-    stat_type = st.selectbox("Leaders stat", ["pts", "ast", "reb", "stl", "blk", "tov", "dreb", "oreb", "min"])
-    vendors_filter = st.multiselect(
-        "Filter odds vendors",
-        ["betmgm", "fanduel", "draftkings", "bet365", "caesars", "espnbet"],
-    )
+    stat_type = st.selectbox("Leaders stat", ["pts","ast","reb","stl","blk","tov","dreb","oreb","min"])
+    vendors_filter = st.multiselect("Filter odds vendors", ["betmgm","fanduel","draftkings","bet365","caesars","espnbet"])
 
 tabs = st.tabs(["Games", "Odds", "Injuries", "Leaders", "Standings", "Props (ML)"])
 
-# --- Games ---
+# Games
 with tabs[0]:
     d = pick_date.strftime("%Y-%m-%d")
     try:
@@ -319,16 +411,14 @@ with tabs[0]:
         if gdf.empty:
             st.write("No games.")
         else:
-            show = gdf[
-                ["id", "date", "status", "home_team", "visitor_team", "home_team_score", "visitor_team_score"]
-            ].copy()
+            show = gdf[["id","date","status","home_team","visitor_team","home_team_score","visitor_team_score"]].copy()
             show["home_team"] = show["home_team"].apply(lambda t: t.get("abbreviation") if isinstance(t, dict) else t)
             show["visitor_team"] = show["visitor_team"].apply(lambda t: t.get("abbreviation") if isinstance(t, dict) else t)
             st.dataframe(show, use_container_width=True)
     except Exception as e:
         st.error(str(e))
 
-# --- Odds ---
+# Odds
 with tabs[1]:
     d = pick_date.strftime("%Y-%m-%d")
     try:
@@ -339,28 +429,28 @@ with tabs[1]:
     except Exception as e:
         st.error(str(e))
 
-# --- Injuries ---
+# Injuries
 with tabs[2]:
     try:
         st.dataframe(df_injuries(), use_container_width=True)
     except Exception as e:
         st.error(str(e))
 
-# --- Leaders ---
+# Leaders
 with tabs[3]:
     try:
         st.dataframe(df_leaders(int(season), stat_type), use_container_width=True)
     except Exception as e:
         st.error(str(e))
 
-# --- Standings ---
+# Standings
 with tabs[4]:
     try:
         st.dataframe(df_standings(int(season)), use_container_width=True)
     except Exception as e:
         st.error(str(e))
 
-# --- Props (ML) ---
+# Props (ML)
 with tabs[5]:
     st.subheader("Train & Predict")
     q = st.text_input("Search active player")
@@ -374,8 +464,7 @@ with tabs[5]:
             st.info("No active player matched.")
         else:
             candidates["display"] = candidates.apply(
-                lambda r: f"{r.get('first_name')} {r.get('last_name')} ({r.get('team',{}).get('abbreviation','?')})",
-                axis=1,
+                lambda r: f"{r.get('first_name')} {r.get('last_name')} ({r.get('team',{}).get('abbreviation','?')})", axis=1
             )
             idx = st.selectbox("Choose player", range(len(candidates)), format_func=lambda i: candidates.iloc[i]["display"])
             player_id = int(candidates.iloc[idx]["id"])
@@ -408,22 +497,19 @@ with tabs[5]:
                         except Exception as e:
                             st.error(str(e))
 
-                        # Compare with odds lines if present
+                        # Compare to odds
                         d = pick_date.strftime("%Y-%m-%d")
                         odf = df_odds(d)
                         if not odf.empty and "player_name" in odf.columns:
                             ply_name = candidates.iloc[idx]["display"].split(" (")[0]
                             mask = odf["player_name"].astype(str).str.contains(ply_name, case=False, na=False)
                             lines = odf.loc[mask]
-                            market_map = {"pts": "points", "reb": "rebounds", "ast": "assists"}
-                            mkt = market_map.get(target, target)
                             if "market" in lines.columns:
+                                mkt = {"pts":"points","reb":"rebounds","ast":"assists"}.get(target, target)
                                 lines = lines[lines["market"].str.contains(mkt, case=False, na=False)]
                             if not lines.empty:
                                 st.write("Odds lines:")
                                 st.dataframe(lines, use_container_width=True)
                         st.caption("Baseline demo; replace with your own feature set/model for production.")
-            else:
-                st.info("Train a model to see predictions.")
     else:
         st.info("Search a player to get started.")
