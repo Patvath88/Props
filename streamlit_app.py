@@ -10,8 +10,6 @@ Env:
   export BALLDONTLIE_API_KEY="YOUR_PRO_KEY"  # or paste in sidebar
 """
 
-from balldontlie_client import APIConfig, BallDontLieClient
-
 import os
 import datetime as dt
 from dataclasses import dataclass
@@ -35,13 +33,13 @@ except Exception:
     _HAS_XGB = False
 
 # ← root-level client module
+from balldontlie_client import APIConfig, BallDontLieClient
 
 
 # ---------- Streamlit setup ----------
 st.set_page_config(page_title="NBA Player Props Projector", layout="wide")
 TODAY = dt.date.today()
 DEFAULT_SEASONS_BACK = 3
-PER_PAGE = 100
 
 TARGETS = {"Points": "PTS", "Rebounds": "REB", "Assists": "AST", "3PM": "FG3M"}
 ROLL_WINDOWS = [3, 5, 10]
@@ -91,7 +89,6 @@ def cached_player_stats(cfg: APIConfig, player_id: int, seasons: Tuple[int, ...]
         return pd.DataFrame()
 
     df = pd.json_normalize(raw)
-
     keep = {
         "id": "stat_id",
         "game.id": "game_id",
