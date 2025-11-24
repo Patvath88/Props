@@ -1,0 +1,36 @@
+# .github/workflows/ci.yml
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      BALDONTLIE_API_KEY: ${{ secrets.BALDONTLIE_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Assert secret is present
+        run: |
+          python - << 'PY'
+          import os, sys
+          key = os.getenv("BALDONTLIE_API_KEY")
+          assert key, "Missing GitHub Actions secret BALDONTLIE_API_KEY"
+          print("BALDONTLIE_API_KEY present (not printed).")
+          PY
+      - name: Deps smoke check
+        run: |
+          python - << 'PY'
+          import numpy, pandas, requests, streamlit, sklearn
+          print("Deps import OK.")
+          PY
