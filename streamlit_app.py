@@ -1,4 +1,4 @@
-# app
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -355,81 +355,138 @@ if player_name:
     overall_means = hist_df.mean()
     recent_means = hist_df.tail(5).mean()
 
-    # User threshold inputs
-    st.markdown("## 🎯 Set Your Prop Lines")
-    cols_thresholds = st.columns(3)
-    # Determine reasonable slider ranges based on historical data
-    # Use the min and max observed values with some padding
-    pts_min, pts_max = hist_df["pts"].min(), hist_df["pts"].max()
-    ast_min, ast_max = hist_df["ast"].min(), hist_df["ast"].max()
-    reb_min, reb_max = hist_df["reb"].min(), hist_df["reb"].max()
+    # Create tabs: Overview (existing output) and Simulation
+    tab_overview, tab_sim = st.tabs(["Overview", "Simulation"])
 
-    with cols_thresholds[0]:
-        pts_threshold = st.slider(
-            "Points Line", min_value=float(max(0, pts_min - 5)), max_value=float(pts_max + 5),
-            value=float(round(pred_pts)), step=0.5, key="pts_threshold"
+    # -------------------------------------------------------------------
+    # Overview Tab
+    # -------------------------------------------------------------------
+    with tab_overview:
+        # User threshold inputs
+        st.markdown("## 🎯 Set Your Prop Lines")
+        cols_thresholds = st.columns(3)
+        # Determine reasonable slider ranges based on historical data
+        # Use the min and max observed values with some padding
+        pts_min, pts_max = hist_df["pts"].min(), hist_df["pts"].max()
+        ast_min, ast_max = hist_df["ast"].min(), hist_df["ast"].max()
+        reb_min, reb_max = hist_df["reb"].min(), hist_df["reb"].max()
+
+        with cols_thresholds[0]:
+            pts_threshold = st.slider(
+                "Points Line", min_value=float(max(0, pts_min - 5)), max_value=float(pts_max + 5),
+                value=float(round(pred_pts)), step=0.5, key="pts_threshold"
+            )
+        with cols_thresholds[1]:
+            ast_threshold = st.slider(
+                "Assists Line", min_value=float(max(0, ast_min - 2)), max_value=float(ast_max + 2),
+                value=float(round(pred_ast, 1)), step=0.5, key="ast_threshold"
+            )
+        with cols_thresholds[2]:
+            reb_threshold = st.slider(
+                "Rebounds Line", min_value=float(max(0, reb_min - 2)), max_value=float(reb_max + 2),
+                value=float(round(pred_reb, 1)), step=0.5, key="reb_threshold"
+            )
+
+        # Compute probabilities
+        prob_pts = compute_threshold_probability(hist_df["pts"], pts_threshold)
+        prob_ast = compute_threshold_probability(hist_df["ast"], ast_threshold)
+        prob_reb = compute_threshold_probability(hist_df["reb"], reb_threshold)
+
+        st.markdown("## 🔮 Predicted Next Game Stats")
+        c_pred = st.columns(3)
+        c_pred[0].metric(
+            "Points", f"{pred_pts:.1f}", help=get_trend_message(pred_pts, overall_means["pts"], recent_means["pts"])
         )
-    with cols_thresholds[1]:
-        ast_threshold = st.slider(
-            "Assists Line", min_value=float(max(0, ast_min - 2)), max_value=float(ast_max + 2),
-            value=float(round(pred_ast, 1)), step=0.5, key="ast_threshold"
+        c_pred[1].metric(
+            "Assists", f"{pred_ast:.1f}", help=get_trend_message(pred_ast, overall_means["ast"], recent_means["ast"])
         )
-    with cols_thresholds[2]:
-        reb_threshold = st.slider(
-            "Rebounds Line", min_value=float(max(0, reb_min - 2)), max_value=float(reb_max + 2),
-            value=float(round(pred_reb, 1)), step=0.5, key="reb_threshold"
+        c_pred[2].metric(
+            "Rebounds", f"{pred_reb:.1f}", help=get_trend_message(pred_reb, overall_means["reb"], recent_means["reb"])
         )
 
-    # Compute probabilities
-    prob_pts = compute_threshold_probability(hist_df["pts"], pts_threshold)
-    prob_ast = compute_threshold_probability(hist_df["ast"], ast_threshold)
-    prob_reb = compute_threshold_probability(hist_df["reb"], reb_threshold)
+        st.markdown("## 📊 Probability of Clearing Your Line")
+        c_prob = st.columns(3)
+        c_prob[0].metric("P(Points ≥ Line)", f"{prob_pts*100:.0f}%")
+        c_prob[1].metric("P(Assists ≥ Line)", f"{prob_ast*100:.0f}%")
+        c_prob[2].metric("P(Rebounds ≥ Line)", f"{prob_reb*100:.0f}%")
 
-    # ---------------------------------------------------------------
-    # OUTPUT: Predictions & Probabilities
-    # ---------------------------------------------------------------
-    st.markdown("## 🔮 Predicted Next Game Stats")
-    c_pred = st.columns(3)
-    c_pred[0].metric("Points", f"{pred_pts:.1f}", help=get_trend_message(pred_pts, overall_means["pts"], recent_means["pts"]))
-    c_pred[1].metric("Assists", f"{pred_ast:.1f}", help=get_trend_message(pred_ast, overall_means["ast"], recent_means["ast"]))
-    c_pred[2].metric("Rebounds", f"{pred_reb:.1f}", help=get_trend_message(pred_reb, overall_means["reb"], recent_means["reb"]))
+        st.markdown("---")
+        st.markdown("### 📈 Recent Trends")
+        # Show last 10 games trends for basic stats
+        st.line_chart(hist_df[["pts", "ast", "reb"]].tail(10))
 
-    st.markdown("## 📊 Probability of Clearing Your Line")
-    c_prob = st.columns(3)
-    c_prob[0].metric("P(Points ≥ Line)", f"{prob_pts*100:.0f}%")
-    c_prob[1].metric("P(Assists ≥ Line)", f"{prob_ast*100:.0f}%")
-    c_prob[2].metric("P(Rebounds ≥ Line)", f"{prob_reb*100:.0f}%")
+        # Summarise last five games vs 30 game means
+        st.markdown("### 📋 Averages Comparison")
+        comparison_data = pd.DataFrame({
+            "Stat": ["Points", "Assists", "Rebounds"],
+            "30‑Game Avg": [overall_means["pts"], overall_means["ast"], overall_means["reb"]],
+            "Last 5 Avg": [recent_means["pts"], recent_means["ast"], recent_means["reb"]],
+            "Prediction": [pred_pts, pred_ast, pred_reb],
+        })
+        st.dataframe(
+            comparison_data.set_index("Stat").style.format("{:.1f}"),
+            use_container_width=True,
+        )
 
-    st.markdown("---")
-    st.markdown("### 📈 Recent Trends")
-    # Show last 10 games trends for basic stats
-    st.line_chart(hist_df[["pts", "ast", "reb"]].tail(10))
+        st.markdown("### 🧮 Distributions and Lines")
+        # Display distribution charts for each stat
+        dist_cols = st.columns(3)
+        with dist_cols[0]:
+            chart = build_distribution_chart(hist_df["pts"], pred_pts, pts_threshold, "Points")
+            st.altair_chart(chart, use_container_width=True)
+        with dist_cols[1]:
+            chart = build_distribution_chart(hist_df["ast"], pred_ast, ast_threshold, "Assists")
+            st.altair_chart(chart, use_container_width=True)
+        with dist_cols[2]:
+            chart = build_distribution_chart(hist_df["reb"], pred_reb, reb_threshold, "Rebounds")
+            st.altair_chart(chart, use_container_width=True)
 
-    # Summarise last five games vs 30 game means
-    st.markdown("### 📋 Averages Comparison")
-    comparison_data = pd.DataFrame({
-        "Stat": ["Points", "Assists", "Rebounds"],
-        "30‑Game Avg": [overall_means["pts"], overall_means["ast"], overall_means["reb"]],
-        "Last 5 Avg": [recent_means["pts"], recent_means["ast"], recent_means["reb"]],
-        "Prediction": [pred_pts, pred_ast, pred_reb],
-    })
-    st.dataframe(
-        comparison_data.set_index("Stat").style.format("{:.1f}"),
-        use_container_width=True,
-    )
+        st.markdown("### 📊 Model Inputs (Latest Row)")
+        st.dataframe(latest, use_container_width=True)
 
-    st.markdown("### 🧮 Distributions and Lines")
-    # Display distribution charts for each stat
-    dist_cols = st.columns(3)
-    with dist_cols[0]:
-        chart = build_distribution_chart(hist_df["pts"], pred_pts, pts_threshold, "Points")
-        st.altair_chart(chart, use_container_width=True)
-    with dist_cols[1]:
-        chart = build_distribution_chart(hist_df["ast"], pred_ast, ast_threshold, "Assists")
-        st.altair_chart(chart, use_container_width=True)
-    with dist_cols[2]:
-        chart = build_distribution_chart(hist_df["reb"], pred_reb, reb_threshold, "Rebounds")
-        st.altair_chart(chart, use_container_width=True)
+    # -------------------------------------------------------------------
+    # Simulation Tab
+    # -------------------------------------------------------------------
+    with tab_sim:
+        st.markdown("## 🎲 Monte Carlo Simulation")
+        st.write(
+            "Run a high‑volume simulation of the next game’s performance. "
+            "Select a statistic and prop line to estimate how often the player "
+            "would clear that line if the distribution holds."
+        )
 
-    st.markdown("### 📊 Model Inputs (Latest Row)")
-    st.dataframe(latest, use_container_width=True)
+        # Select statistic to simulate
+        stat_choice = st.selectbox("Select Statistic", ["Points", "Assists", "Rebounds"], key="sim_stat")
+
+        # Map selection to data
+        stat_map = {
+            "Points": (hist_df["pts"], pred_pts),
+            "Assists": (hist_df["ast"], pred_ast),
+            "Rebounds": (hist_df["reb"], pred_reb),
+        }
+        values, predicted_value = stat_map[stat_choice]
+
+        # Determine slider range for simulation line
+        sim_min = float(max(0, values.min() - 5))
+        sim_max = float(values.max() + 5)
+        default_line = float(round(predicted_value))
+
+        sim_line = st.slider(
+            f"{stat_choice} Line", min_value=sim_min, max_value=sim_max,
+            value=default_line, step=0.5, key="sim_line"
+        )
+
+        # Button to trigger simulation
+        if st.button("Run 1M Simulations", key="run_sim"):
+            with st.spinner("Simulating…"):
+                # Adjust the distribution to centre on the predicted mean
+                adjusted = values + (predicted_value - values.mean())
+                sims = np.random.choice(adjusted, size=1_000_000, replace=True)
+                prob_hit = float((sims >= sim_line).mean())
+
+            st.success(
+                f"Estimated probability of {stat_choice} ≥ {sim_line:.1f}: {prob_hit * 100:.1f}%"
+            )
+            # Show a histogram of simulated values with overlay lines
+            sim_chart = build_distribution_chart(pd.Series(sims), predicted_value, sim_line, stat_choice)
+            st.altair_chart(sim_chart, use_container_width=True)
