@@ -1,316 +1,617 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime
 from xgboost import XGBRegressor
+from scipy.stats import norm
 
 # ============================================================
-# SECTION 1 — CONFIG & BASE SETUP
+# CONFIG
 # ============================================================
 
-API_KEY = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"
+API_KEY = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"  # <- your BallDontLie key
 BASE_URL = "https://api.balldontlie.io/v1"
 HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 
 st.set_page_config(page_title="NBA Luxe AI Predictor", layout="wide")
 
 # ============================================================
-# SECTION 6 — MOBILE + POLISH CSS
+# THEME: Black + Purple Luxe
 # ============================================================
 
-MOBILE_CSS = """
+LUXE_CSS = """
 <style>
-.main .block-container {padding-top:1rem!important;}
-@media (max-width:900px){
- .main .block-container{padding-left:.5rem!important;padding-right:.5rem!important;}
- h1{font-size:1.7rem!important;}
- .luxe-card,.soft-card{padding:.9rem!important;}
+/* Global */
+.stApp {
+    background: radial-gradient(circle at top, #3b0066 0, #050009 40%, #020006 100%) !important;
+    color: #f5f2ff !important;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+}
+
+/* Centered main container */
+.main .block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+    max-width: 1100px;
+}
+
+/* Headings */
+h1, h2, h3, h4, h5 {
+    color: #f8f0ff !important;
+    font-weight: 700 !important;
+}
+
+/* Purple cards */
+.luxe-card {
+    background: rgba(8, 1, 20, 0.9);
+    border-radius: 18px;
+    padding: 1.2rem 1.3rem;
+    border: 1px solid rgba(155, 89, 182, 0.8);
+    box-shadow: 0 0 30px rgba(155, 89, 182, 0.45);
+}
+
+/* Soft cards */
+.soft-card {
+    background: rgba(15, 8, 30, 0.9);
+    border-radius: 16px;
+    padding: 1rem 1.1rem;
+    border: 1px solid rgba(155, 89, 182, 0.4);
+}
+
+/* Metrics */
+[data-testid="stMetricValue"] {
+    color: #fff;
+    font-weight: 800;
+}
+[data-testid="stMetricLabel"] {
+    color: #c2b5ff;
+}
+
+/* Buttons */
+.stButton>button {
+    background: linear-gradient(90deg, #8e44ad, #9b59b6);
+    color: #fff;
+    border-radius: 999px;
+    border: none;
+    padding: 0.4rem 1.2rem;
+    font-weight: 600;
+}
+.stButton>button:hover {
+    box-shadow: 0 0 18px rgba(155, 89, 182, 0.75);
+}
+
+/* Inputs */
+.stTextInput>div>div>input,
+.stSelectbox div[data-baseweb="select"],
+.stNumberInput input {
+    background: rgba(18, 8, 40, 0.9) !important;
+    border-radius: 999px !important;
+    border: 1px solid rgba(155, 89, 182, 0.7) !important;
+    color: #f8f0ff !important;
+}
+
+/* Sidebar saved players */
+.sidebar-section {
+    background: rgba(8, 1, 20, 0.96);
+    border-radius: 16px;
+    padding: 0.8rem 0.8rem 1.1rem 0.8rem;
+    border: 1px solid rgba(155, 89, 182, 0.7);
+}
+
+.sidebar-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: #f5f2ff;
+}
+
+.sidebar-player {
+    font-size: 0.87rem;
+    margin-bottom: 0.3rem;
+}
+
+/* Images */
+.player-image {
+    border-radius: 16px;
+    border: 2px solid rgba(155, 89, 182, 0.8);
+    box-shadow: 0 0 22px rgba(155, 89, 182, 0.5);
+    max-width: 100%;
+}
+
+/* Tables */
+table {
+    color: #f5f2ff !important;
 }
 </style>
 """
-st.markdown(MOBILE_CSS, unsafe_allow_html=True)
+st.markdown(LUXE_CSS, unsafe_allow_html=True)
 
 # ============================================================
-# SECTION 2 — API HELPERS + DEF RATING ENGINE
+# CONSTANTS / SETTINGS
 # ============================================================
 
-def api_get(endpoint, params=None):
+# Stats weâll model & simulate
+STAT_COLUMNS = [
+    "pts",
+    "reb",
+    "ast",
+    "stl",
+    "blk",
+    "turnover",
+    "fgm",
+    "fga",
+    "fg3m",
+    "fg3a",
+    "ftm",
+    "fta",
+    "oreb",
+    "dreb",
+    "pf",
+]
+
+DEFAULT_MONTE_CARLO_SIMS = 5000  # can be increased later if you want
+
+# ============================================================
+# API HELPERS (with caching)
+# ============================================================
+
+@st.cache_data(show_spinner=False, ttl=300)
+def api_get(endpoint: str, params: dict | None = None):
     try:
-        r = requests.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/{endpoint}",
+            headers=HEADERS,
+            params=params,
+            timeout=10
+        )
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        return {"error":str(e),"data":[]}
+        return {"error": str(e), "data": []}
 
-@st.cache_data(ttl=600)
-def search_players(q):
-    if not q or len(q)<2: return []
-    return api_get("players",{"search":q,"per_page":25}).get("data",[])
 
-@st.cache_data(ttl=600)
-def get_player_stats(pid, n=40):
-    data = api_get("stats",{"player_ids[]":pid,"per_page":n}).get("data",[])
-    return pd.json_normalize(data) if data else pd.DataFrame()
+@st.cache_data(show_spinner=False, ttl=600)
+def search_players(query: str, per_page: int = 25):
+    if not query or len(query.strip()) < 2:
+        return []
+    data = api_get("players", {"search": query.strip(), "per_page": per_page, "page": 1})
+    return data.get("data", [])
 
-@st.cache_data(ttl=600)
+
+@st.cache_data(show_spinner=False, ttl=600)
+def get_player_stats(player_id: int, n_games: int = 40):
+    # BDL returns most recent first
+    data = api_get("stats", {"player_ids[]": player_id, "per_page": n_games})
+    stats = data.get("data", [])
+    if not stats:
+        return pd.DataFrame()
+    df = pd.json_normalize(stats)
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=600)
 def get_teams():
-    return api_get("teams",{"per_page":50}).get("data",[])
+    # get all teams for opponent dropdown
+    data = api_get("teams", {"per_page": 50})
+    return data.get("data", [])
 
-@st.cache_data(ttl=600)
-def get_next_opponent(team_id:int):
-    today = datetime.today().strftime("%Y-%m-%d")
-    games = api_get("games",{"start_date":today,"per_page":50}).get("data",[])
-    for g in games:
-        if g["home_team"]["id"]==team_id:
-            v=g["visitor_team"]; return v["id"],v["abbreviation"]
-        if g["visitor_team"]["id"]==team_id:
-            h=g["home_team"]; return h["id"],h["abbreviation"]
-    return None,None
 
-@st.cache_data(ttl=3600)
-def scrape_bbref_def():
-    try:
-        url="https://www.basketball-reference.com/leagues/NBA_2026.html"
-        tbl=pd.read_html(url,match="Team Per 100 Poss")[0]
-        tbl.columns=tbl.columns.droplevel(0)
-        tbl["Team"]=tbl["Team"].str.replace("*","",regex=False)
-        tbl=tbl[["Team","DRtg"]]
-        tbl["DRtg"]=pd.to_numeric(tbl["DRtg"],errors="coerce")
-        return dict(zip(tbl["Team"],tbl["DRtg"]))
-    except:
-        return {}
+def get_headshot_url(player_id: int) -> str:
+    # Using Balldontlie headshot CDN as chosen (H2)
+    return f"https://balldontlie.io/images/headshots/{player_id}.png"
 
-@st.cache_data(ttl=1800)
-def fetch_def_components(season=2025):
-    data=api_get("team_stats",{"season":season,"per_page":50}).get("data",[])
-    df=pd.json_normalize(data)
-    if df.empty: return {}
-    df["opp_pts"]=df["opponent.points"]
-    df["opp_fga"]=df["opponent.field_goals_attempted"]
-    df["opp_fgm"]=df["opponent.field_goals_made"]
-    df["opp_fg3a"]=df["opponent.three_point_attempts"]
-    df["opp_fg3m"]=df["opponent.three_point_made"]
-    df["pace"]=df["possessions"]/df["games_played"]
-    df["efg_allowed"]=(df["opp_fgm"]+0.5*df["opp_fg3m"])/df["opp_fga"]
-    df["comp"]=100*(df["opp_pts"]/df["possessions"])*0.55 + df["efg_allowed"]*50*0.30 + df["pace"]*1.2*0.15
-    return dict(zip(df["team.abbreviation"],df["comp"]))
-
-@st.cache_data(ttl=1800)
-def build_def_table():
-    bb= scrape_bbref_def()
-    comp = fetch_def_components()
-    out={}
-    for t,v in comp.items():
-        if t in bb: out[t]=(bb[t]+v+v)/3
-        else: out[t]=(v+v)/2
-    return out
-
-def get_opp_def_rating(abbr:str):
-    return build_def_table().get(abbr,113.0)
-
-def get_headshot_url(pid:int):
-    return f"https://balldontlie.io/images/headshots/{pid}.png"
 
 # ============================================================
-# SECTION 3 — FEATURE ENGINEERING + XGB MODELS
+# FEATURE ENGINEERING & MODELS
 # ============================================================
 
-STAT_COLUMNS=["pts","reb","ast","stl","blk","turnover","fgm","fga","fg3m","fg3a","ftm","fta","oreb","dreb","pf"]
+def normalize_stats_df(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Extract and normalize just what we need."""
+    # Flatten nested columns if any (e.g. "stats.pts")
+    cols = df_raw.columns
+    # Try to map to base stat names
+    stat_map = {}
+    for stat in STAT_COLUMNS:
+        candidates = [c for c in cols if c.split(".")[-1] == stat]
+        if len(candidates) > 0:
+            stat_map[stat] = candidates[0]
 
-def normalize_stats_df(df):
-    smap={}
-    for s in STAT_COLUMNS:
-        cand=[c for c in df.columns if c.split(".")[-1]==s]
-        if cand: smap[s]=cand[0]
-    if not smap: return pd.DataFrame()
-    out=pd.DataFrame()
-    for s,c in smap.items(): out[s]=pd.to_numeric(df[c],errors="coerce")
-    return out.dropna(how="all")
+    if not stat_map:
+        return pd.DataFrame()
 
-def add_rolling_features(df,window=5):
-    f=df.copy()
-    for c in STAT_COLUMNS:
-        if c in f:
-            f[f"{c}_roll_{window}"]=f[c].rolling(window).mean()
-            f[f"{c}_prev"]=f[c].shift(1)
-    return f.dropna()
+    df = pd.DataFrame()
+    for stat, col in stat_map.items():
+        df[stat] = pd.to_numeric(df_raw[col], errors="coerce")
 
-def add_context(df,pace,dr):
-    f=df.copy()
-    f["pace_factor"]=pace
-    f["opp_dr"]=dr
-    f["opp_scaled"]=dr/100
-    f["pace_x_dr"]=pace*dr
-    return f
+    # Drop rows with all nan
+    df = df.dropna(how="all")
+    return df
 
-def train_player_models(df,targets):
-    models,resid={},{}
-    feat=[c for c in df.columns if c.endswith("_roll_5") or c.endswith("_prev") or c in ["pace_factor","opp_dr","opp_scaled","pace_x_dr"]]
-    if not feat: return {},{}
-    X=df[feat].values
-    for s in targets:
-        if s not in df: continue
-        y=df[s].values
-        if len(y)<8 or len(np.unique(y))<=1: continue
-        m=XGBRegressor(
-            n_estimators=240,learning_rate=0.05,max_depth=4,
-            subsample=0.9,colsample_bytree=0.9,objective="reg:squarederror",n_jobs=2
+
+def add_rolling_features(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+    """Add rolling averages as features + simple form indicators."""
+    feat_df = df.copy()
+    for col in STAT_COLUMNS:
+        if col in feat_df.columns:
+            feat_df[f"{col}_roll_{window}"] = feat_df[col].rolling(window).mean()
+    # Simple last-game features
+    for col in STAT_COLUMNS:
+        if col in feat_df.columns:
+            feat_df[f"{col}_prev"] = feat_df[col].shift(1)
+
+    # Drop initial NA rows from rolling features
+    feat_df = feat_df.dropna()
+    return feat_df
+
+
+def build_pace_and_opponent_features(feat_df: pd.DataFrame, pace_factor: float, opp_difficulty: float) -> pd.DataFrame:
+    """Inject pace & opponent sliders as features so models can condition on them."""
+    feat_df = feat_df.copy()
+    feat_df["pace_factor"] = pace_factor
+    feat_df["opp_difficulty"] = opp_difficulty
+    # interaction feature for 'deep-ish' behaviour
+    feat_df["pace_x_opp"] = pace_factor * opp_difficulty
+    return feat_df
+
+
+def train_models_for_player(
+    feat_df: pd.DataFrame,
+    targets: list[str],
+    pace_factor: float,
+    opp_difficulty: float,
+):
+    """Train an XGB model per stat target, with simple residual std for MC."""
+    models = {}
+    residuals = {}
+
+    # Add pace/opponent dims to features
+    feat_df = build_pace_and_opponent_features(feat_df, pace_factor, opp_difficulty)
+
+    # Features: all rolling + prev + pace/opponent
+    feature_cols = [c for c in feat_df.columns if any(
+        [
+            c.endswith("_roll_5"),
+            c.endswith("_prev"),
+            c in ["pace_factor", "opp_difficulty", "pace_x_opp"],
+        ]
+    )]
+
+    if len(feature_cols) == 0:
+        return {}, {}
+
+    X = feat_df[feature_cols].values
+
+    for stat in targets:
+        if stat not in feat_df.columns:
+            continue
+        y = feat_df[stat].values
+        if len(np.unique(y)) <= 1 or len(y) < 8:
+            # Too few games or no variance: skip modeling this stat
+            continue
+
+        model = XGBRegressor(
+            n_estimators=250,
+            learning_rate=0.05,
+            max_depth=4,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            objective="reg:squarederror",
+            n_jobs=2,
         )
-        m.fit(X,y)
-        pr=m.predict(X)
-        r=y-pr
-        resid_std=float(np.std(r)) if len(r)>1 else 1.0
-        models[s]=(m,feat); resid[s]=max(0.4,resid_std)
-    return models,resid
+        model.fit(X, y)
 
-def predict_next_game(models,resid,lastrow,pace,dr):
-    preds,stds={},{}
-    base=lastrow.copy()
-    base["pace_factor"]=pace
-    base["opp_dr"]=dr
-    base["opp_scaled"]=dr/100
-    base["pace_x_dr"]=pace*dr
-    for s,(m,cols) in models.items():
-        x=np.array([base[cols].values])
-        mu=float(m.predict(x)[0])
-        preds[s]=max(0,mu); stds[s]=resid[s]
-    return preds,stds
+        y_pred = model.predict(X)
+        resid = y - y_pred
+        resid_std = float(np.std(resid)) if len(resid) > 1 else 0.0
 
-# ============================================================
-# SECTION 4 — MONTE CARLO + EV ENGINE
-# ============================================================
+        models[stat] = (model, feature_cols)
+        residuals[stat] = resid_std
 
-def run_mc(preds,stds,n=5000):
-    out={}
-    for s,mu in preds.items():
-        sigma=max(0.4,stds.get(s,1.0))
-        d=np.random.normal(mu,sigma,n)
-        d=np.clip(d,0,None)
-        out[s]=d
-    return pd.DataFrame(out)
+    return models, residuals
 
-def summarize_dist(a):
-    return {"mean":float(a.mean()),"std":float(a.std()),
-            "p25":float(np.percentile(a,25)),"p50":float(np.percentile(a,50)),
-            "p75":float(np.percentile(a,75)),"p90":float(np.percentile(a,90))}
 
-def prob_clear(a,line): return float((a>line).mean())
+def predict_next_game(
+    models: dict,
+    residuals: dict,
+    latest_feat_row: pd.Series,
+    pace_factor: float,
+    opp_difficulty: float,
+):
+    """Make stat predictions + attach residual std for MC."""
+    preds = {}
+    stds = {}
 
-def implied_prob(odds):
-    return 100/(odds+100) if odds>0 else -odds/(-odds+100)
+    base_row = latest_feat_row.copy()
+    base_row["pace_factor"] = pace_factor
+    base_row["opp_difficulty"] = opp_difficulty
+    base_row["pace_x_opp"] = pace_factor * opp_difficulty
 
-def compute_ev(p,odds):
-    payout=odds/100 if odds>0 else 100/(-odds)
-    return p*payout - (1-p)*1.0
+    for stat, (model, feature_cols) in models.items():
+        x = np.array([base_row[feature_cols].values], dtype=float)
+        mu = float(model.predict(x)[0])
+        preds[stat] = max(0.0, mu)  # stats can't be negative
+        stds[stat] = max(0.5, residuals.get(stat, 1.0))  # floor on std
 
-def evaluate_prop(draws,line,odds):
-    p=prob_clear(draws,line); imp=implied_prob(odds); ev=compute_ev(p,odds)
-    return {"prob_over":p,"implied_prob":imp,"edge":p-imp,"ev":ev}
+    return preds, stds
+
 
 # ============================================================
-# SECTION 5 — UI LAYER
+# MONTE CARLO ENGINE
 # ============================================================
 
-def render_player_header(obj,name,img,pace,dr,abbr):
-    c1,c2=st.columns([1,2])
-    with c1: st.image(img,use_column_width=True)
-    with c2:
-        st.markdown(f"### {name}")
-        st.markdown(f"Team: {obj['team']['full_name']} ({obj['team']['abbreviation']})")
-        st.markdown(f"Position: {obj.get('position','N/A')}")
-        st.markdown(f"Next Opponent: {abbr}")
-        st.markdown(f"Opponent DRtg: {dr:.1f}")
-        st.markdown(f"Pace Factor: {pace:.2f}")
+def run_monte_carlo(pred_means: dict, pred_stds: dict, n_sims: int = DEFAULT_MONTE_CARLO_SIMS):
+    """
+    Run simple normal-based MC for every stat. Easy to swap in
+    more complex distributions later.
+    """
+    stats = list(pred_means.keys())
+    sims = {}
 
-def render_core(preds):
-    c1,c2,c3=st.columns(3)
-    c1.metric("Points",f"{preds.get('pts',0):.1f}")
-    c2.metric("Rebounds",f"{preds.get('reb',0):.1f}")
-    c3.metric("Assists",f"{preds.get('ast',0):.1f}")
+    for stat in stats:
+        mu = pred_means[stat]
+        sigma = max(0.5, pred_stds.get(stat, 1.0))
+        draws = np.random.normal(mu, sigma, size=n_sims)
+        draws = np.clip(draws, 0, None)
+        sims[stat] = draws
 
-def render_table(df):
-    rows=[]
-    for c in df.columns:
-        s=summarize_dist(df[c])
-        rows.append({
-            "Stat":c.upper(),"Mean":f"{s['mean']:.2f}","Std":f"{s['std']:.2f}",
-            "P25":f"{s['p25']:.1f}","Median":f"{s['p50']:.1f}",
-            "P75":f"{s['p75']:.1f}","P90":f"{s['p90']:.1f}"
-        })
-    st.dataframe(pd.DataFrame(rows),use_container_width=True)
+    sims_df = pd.DataFrame(sims)
+    return sims_df
 
-def render_betting(df):
-    st.markdown("## Prop Betting Evaluation")
-    stat=st.selectbox("Stat",df.columns)
-    line=st.number_input("Line",value=20.5,step=0.5)
-    odds=st.number_input("Odds",value=-115,step=1)
-    res=evaluate_prop(df[stat].values,line,odds)
-    c1,c2,c3=st.columns(3)
-    c1.metric("Prob Over",f"{res['prob_over']*100:.1f}%")
-    c2.metric("Edge",f"{res['edge']*100:.1f}%")
-    c3.metric("EV",f"{res['ev']:.3f}")
 
-def render_dist(df):
-    st.markdown("### Distribution")
-    stat=st.selectbox("View Distribution",df.columns)
-    st.bar_chart(df[stat])
+def summarize_distribution(draws: np.ndarray) -> dict:
+    return {
+        "mean": float(np.mean(draws)),
+        "std": float(np.std(draws)),
+        "p25": float(np.percentile(draws, 25)),
+        "p50": float(np.percentile(draws, 50)),
+        "p75": float(np.percentile(draws, 75)),
+        "p90": float(np.percentile(draws, 90)),
+    }
 
-def render_recent(df):
-    st.markdown("### Recent Form")
-    last=df.tail(10)
-    st.line_chart(last[["pts","reb","ast"]])
 
 # ============================================================
-# MAIN
+# SESSION STATE HELPERS
+# ============================================================
+
+if "saved_players" not in st.session_state:
+    st.session_state["saved_players"] = []  # list of dicts
+
+
+def save_player_prediction(name: str, preds: dict):
+    st.session_state["saved_players"].append(
+        {
+            "name": name,
+            **preds,
+        }
+    )
+
+
+# ============================================================
+# MAIN UI
 # ============================================================
 
 def main():
-    st.title("🏀 NBA Luxe AI Predictor")
+    st.markdown(
+        "<h1 style='text-align:center;'>ð NBA Luxe AI Predictor</h1>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<p style='text-align:center; color:#d9c0ff;'>Black + Purple single-page research lab powered by BallDontLie + XGBoost + Monte Carlo.</p>",
+        unsafe_allow_html=True,
+    )
 
-    query=st.text_input("Search Player")
-    players=search_players(query) if len(query)>=2 else []
-    if not players:
-        if len(query)>=2: st.warning("No players found.")
+    # ------------------ SIDEBAR: Saved players compare ------------------
+    with st.sidebar:
+        st.markdown("<div class='sidebar-section'>", unsafe_allow_html=True)
+        st.markdown("<div class='sidebar-title'>â­ Saved Players</div>", unsafe_allow_html=True)
+        if st.session_state["saved_players"]:
+            for p in st.session_state["saved_players"]:
+                st.markdown(
+                    f"<div class='sidebar-player'>{p['name']}</div>",
+                    unsafe_allow_html=True,
+                )
+            if st.button("Clear Saved Players", key="clear_saved"):
+                st.session_state["saved_players"] = []
+        else:
+            st.markdown(
+                "<div class='sidebar-player'>No players saved yet.</div>",
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    # ------------------ Player search + opponent/pace controls ----------
+    with st.container():
+        st.markdown("<div class='luxe-card'>", unsafe_allow_html=True)
+
+        col_search, col_opp, col_pace = st.columns([2.3, 1.3, 1.3])
+
+        with col_search:
+            query = st.text_input("Search player (autocomplete)", value="", placeholder="Type at least 2 lettersâ¦")
+            players = search_players(query) if len(query) >= 2 else []
+
+            player_choice = None
+            player_obj = None
+
+            if players:
+                names = [
+                    f"{p['first_name']} {p['last_name']} ({p['team']['abbreviation']})"
+                    for p in players
+                ]
+                idx = st.selectbox("Select player", list(range(len(names))), format_func=lambda i: names[i])
+                player_choice = players[idx]
+                player_obj = player_choice
+            elif len(query) >= 2:
+                st.warning("No players found for that search yet. Try full name.")
+
+        with col_opp:
+            teams = get_teams()
+            if teams:
+                team_names = [f"{t['full_name']} ({t['abbreviation']})" for t in teams]
+                team_ids = [t["id"] for t in teams]
+                opp_idx = st.selectbox("Opponent (for adjustment)", list(range(len(team_names))), format_func=lambda i: team_names[i])
+                opp_team_id = team_ids[opp_idx]
+            else:
+                st.write("No team data.")
+                opp_team_id = None
+
+        with col_pace:
+            pace_factor = st.slider("Expected Pace Factor", 0.8, 1.2, 1.0, 0.01)
+            opp_difficulty = st.slider("Opponent Difficulty", 0.8, 1.2, 1.0, 0.01)
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if not player_obj:
+        st.info("Search and select a player to get predictions.")
         return
 
-    names=[f"{p['first_name']} {p['last_name']} ({p['team']['abbreviation']})" for p in players]
-    idx=st.selectbox("Select Player",range(len(names)),format_func=lambda i:names[i])
-    obj=players[idx]; pid=obj["id"]; team_id=obj["team"]["id"]
-    name=f"{obj['first_name']} {obj['last_name']}"
-    img=get_headshot_url(pid)
+    player_id = player_obj["id"]
+    player_name = f"{player_obj['first_name']} {player_obj['last_name']}"
 
-    opp_id,opp_abbr=get_next_opponent(team_id)
-    if opp_id is None:
-        st.error("No upcoming opponent found.")
-        return
+    # ------------------ Player header + image ---------------------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    top_col1, top_col2 = st.columns([1, 2])
 
-    opp_dr=get_opp_def_rating(opp_abbr)
-    pace=st.slider("Pace Factor",0.85,1.20,1.00,0.01)
+    with top_col1:
+        img_url = get_headshot_url(player_id, first=player_obj['first_name'], last=player_obj['last_name'])
+        st.image(img_url, caption=player_name, use_column_width=True, output_format="PNG")
 
-    raw=get_player_stats(pid,40)
-    core=normalize_stats_df(raw)
-    feat=add_rolling_features(core)
-    feat=add_context(feat,pace,opp_dr)
+    with top_col2:
+        st.markdown("<div class='soft-card'>", unsafe_allow_html=True)
+        st.markdown(f"### {player_name}")
+        st.markdown(
+            f"**Team:** {player_obj['team']['full_name']} ({player_obj['team']['abbreviation']})  \n"
+            f"**Position:** {player_obj.get('position') or 'N/A'}"
+        )
+        st.markdown(
+            f"- Expected Pace Factor: `{pace_factor:.2f}`  \n"
+            f"- Opponent Difficulty: `{opp_difficulty:.2f}`  \n"
+            f"- Monte Carlo Sims: `{DEFAULT_MONTE_CARLO_SIMS}`"
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    models,resid=train_player_models(feat,STAT_COLUMNS)
-    if not models:
-        st.error("Not enough stats to model.")
-        return
+    # ------------------ Fetch stats and build models --------------------
+    with st.spinner("Pulling recent games and building modelsâ¦"):
+        raw_stats = get_player_stats(player_id, n_games=40)
+        if raw_stats.empty:
+            st.error("No stats available for this player.")
+            return
 
-    last=feat.iloc[-1]
-    preds,stds=predict_next_game(models,resid,last,pace,opp_dr)
+        core_stats = normalize_stats_df(raw_stats)
+        if core_stats.empty or len(core_stats) < 8:
+            st.error("Not enough usable games for modeling. Need at least ~8-10.")
+            return
 
-    sims=run_mc(preds,stds)
+        feat_df = add_rolling_features(core_stats, window=5)
+        if feat_df.empty:
+            st.error("Not enough data after rolling feature generation.")
+            return
 
-    render_player_header(obj,name,img,pace,opp_dr,opp_abbr)
-    render_core(preds)
-    st.markdown("### Full Stat Table")
-    render_table(sims)
-    render_betting(sims)
-    render_dist(sims)
-    render_recent(core)
+        # Use current pace/opponent factors when training to fit to that context
+        models, residuals = train_models_for_player(
+            feat_df,
+            STAT_COLUMNS,
+            pace_factor=pace_factor,
+            opp_difficulty=opp_difficulty,
+        )
 
-if __name__=="__main__":
+        if not models:
+            st.error("Could not train any models for this player.")
+            return
+
+        latest_row = feat_df.iloc[-1]
+        preds, pred_stds = predict_next_game(
+            models,
+            residuals,
+            latest_row,
+            pace_factor=pace_factor,
+            opp_difficulty=opp_difficulty,
+        )
+
+        sims_df = run_monte_carlo(preds, pred_stds, n_sims=DEFAULT_MONTE_CARLO_SIMS)
+
+    # ------------------ Top-line Pts / Reb / Ast ------------------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("<div class='luxe-card'>", unsafe_allow_html=True)
+    st.markdown("## ð® Core Line (Next Game)")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Points", f"{preds.get('pts', np.nan):.1f}")
+    c2.metric("Rebounds", f"{preds.get('reb', np.nan):.1f}")
+    c3.metric("Assists", f"{preds.get('ast', np.nan):.1f}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ------------------ Full stat table ------------------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("### ð Full Predicted Stat Line")
+
+    stat_rows = []
+    for stat in STAT_COLUMNS:
+        if stat in preds:
+            draws = sims_df[stat]
+            summary = summarize_distribution(draws)
+            stat_rows.append(
+                {
+                    "Stat": stat.upper(),
+                    "Mean": f"{summary['mean']:.2f}",
+                    "Std": f"{summary['std']:.2f}",
+                    "P25": f"{summary['p25']:.1f}",
+                    "Median": f"{summary['p50']:.1f}",
+                    "P75": f"{summary['p75']:.1f}",
+                    "P90": f"{summary['p90']:.1f}",
+                }
+            )
+
+    if stat_rows:
+        stat_df = pd.DataFrame(stat_rows)
+        st.dataframe(stat_df, use_container_width=True)
+    else:
+        st.write("No modeled stats found.")
+
+    # ------------------ Monte Carlo distribution viewer ---------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("### ð² Monte Carlo Distribution Explorer")
+
+    if preds:
+        stat_options = list(preds.keys())
+        chosen_stat = st.selectbox(
+            "Choose a stat to view its probability distribution",
+            stat_options,
+            index=stat_options.index("pts") if "pts" in stat_options else 0,
+        )
+
+        draws = sims_df[chosen_stat]
+        summary = summarize_distribution(draws)
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric(f"{chosen_stat.upper()} Mean", f"{summary['mean']:.2f}")
+        c5.metric("Std Dev", f"{summary['std']:.2f}")
+        c6.metric("P90", f"{summary['p90']:.1f}")
+
+        st.bar_chart(draws)  # quick visual; can be upgraded to density later
+
+    # ------------------ Recent form section -----------------------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown("### ð Recent Form (Last 10 Games)")
+
+    last10 = core_stats.tail(10)
+    st.line_chart(last10[["pts", "reb", "ast"]])
+
+    # ------------------ Save player + compare table ---------------------
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_save, col_compare = st.columns([1, 3])
+
+    with col_save:
+        if st.button("â­ Save Player & Line", key="save_player"):
+            save_player_prediction(player_name, preds)
+            st.success("Player saved. Check sidebar for list.")
+
+    with col_compare:
+        if st.session_state["saved_players"]:
+            st.markdown("#### ð Saved Players Comparison")
+            comp_df = pd.DataFrame(st.session_state["saved_players"])
+            st.dataframe(comp_df, use_container_width=True)
+
+
+if __name__ == "__main__":
     main()
+
