@@ -4,7 +4,6 @@ BALLDONTLIE client with base-URL auto-detection.
 Probes: /v1 → /v2 → legacy /api/v1. Keeps Bearer auth for paid.
 """
 
-from __future__ import annotations
 
 import time
 from dataclasses import dataclass
