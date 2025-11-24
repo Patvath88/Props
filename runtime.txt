@@ -1,9 +1,1 @@
-# requirements.txt
-# Pin to reasonably recent, lightweight versions.
-streamlit>=1.33,<2
-requests>=2.31,<3
-pandas>=2.0,<3
-numpy>=1.24,<3
-scikit-learn>=1.3,<1.6
-altair>=5,<6
-# xgboost is optional; enable via Docker build-arg INCLUDE_XGB=true
+3.11
