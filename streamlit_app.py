@@ -10,6 +10,8 @@ Env:
   export BALLDONTLIE_API_KEY="YOUR_PRO_KEY"  # or paste in sidebar
 """
 
+from __future__ import annotations
+
 import os
 import datetime as dt
 from dataclasses import dataclass
