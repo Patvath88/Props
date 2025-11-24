@@ -35,9 +35,18 @@ def fetch(endpoint, params=None):
 
 
 def get_player_id(name):
-    data = fetch("players", {"search": name})
-    if data["data"]:
-        return data["data"][0]["id"], data["data"][0]
+    params = {
+        "search": name,
+        "per_page": 100,   # REQUIRED or BDL returns empty
+        "page": 1
+    }
+    
+    data = fetch("players", params)
+
+    if "data" in data and len(data["data"]) > 0:
+        player = data["data"][0]
+        return player["id"], player
+    
     return None, None
 
 
