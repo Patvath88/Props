@@ -10,6 +10,7 @@ Env:
   export BALLDONTLIE_API_KEY="YOUR_PRO_KEY"  # or paste in sidebar
 """
 
+from balldontlie_client import APIConfig, BallDontLieClient
 from __future__ import annotations
 
 import os
@@ -35,7 +36,6 @@ except Exception:
     _HAS_XGB = False
 
 # ← root-level client module
-from balldontlie_client import APIConfig, BallDontLieClient
 
 
 # ---------- Streamlit setup ----------
