@@ -1,274 +1,169 @@
+
+# Mobile Luxe NBA Predictor - Full Rebuild
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
 from xgboost import XGBRegressor
 
-# ============================================================
-# CONFIG
-# ============================================================
+st.set_page_config(page_title="NBA Luxe Mobile Predictor", layout="centered")
 
-API_KEY = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"  # your BallDontLie key
+API_KEY = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"
 BASE_URL = "https://api.balldontlie.io/v1"
-HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+HEADERS = {"Authorization": API_KEY, "X-API-KEY": API_KEY}
 
-st.set_page_config(page_title="NBA Luxe AI Predictor", layout="wide")
-
-# ============================================================
-# THEME
-# ============================================================
-
-LUXE_CSS = """
+LUXE = """
 <style>
-.stApp {
-    background: radial-gradient(circle at top, #3b0066 0, #050009 40%, #020006 100%) !important;
-    color: #f5f2ff !important;
-}
-h1, h2, h3, h4 {
-    color: #f8f0ff !important;
-    font-weight: 700 !important;
-}
-.luxe-card {
-    background: rgba(8, 1, 20, 0.9);
+.stApp { background: #07010f; color: #f3eaff; }
+.big-card {
+    background: rgba(25,10,50,0.85);
+    padding: 18px;
     border-radius: 18px;
-    padding: 1.2rem;
-    border: 1px solid rgba(155, 89, 182, 0.8);
-    box-shadow: 0 0 30px rgba(155, 89, 182, 0.45);
+    border: 1px solid #8f47ff;
+    box-shadow: 0 0 20px rgba(143,71,255,0.4);
 }
-.soft-card {
-    background: rgba(15, 8, 30, 0.9);
-    border-radius: 16px;
-    padding: 1rem;
-    border: 1px solid rgba(155, 89, 182, 0.4);
+.metric-card {
+    background: rgba(50,20,90,0.9);
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid #a574ff;
+    text-align: center;
 }
-.stMetricValue {
-    color: #fff !important;
-    font-weight: 800 !important;
+.metric-value {
+    font-size: 32px;
+    font-weight: 800;
+    color: #ffffff;
+}
+.metric-label {
+    font-size: 14px;
+    color: #d4c7ff;
 }
 </style>
 """
-st.markdown(LUXE_CSS, unsafe_allow_html=True)
+st.markdown(LUXE, unsafe_allow_html=True)
 
-# ============================================================
-# STAT SETTINGS
-# ============================================================
-
-STAT_COLUMNS = ["pts", "reb", "ast", "fg3m"]
-DEFAULT_MONTE_CARLO_SIMS = 5000
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-@st.cache_data(ttl=300)
 def api_get(endpoint, params=None):
     try:
-        r = requests.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=10)
-        r.raise_for_status()
+        r = requests.get(f"{BASE_URL}/{endpoint}", headers=HEADERS, params=params, timeout=8)
+        if r.status_code != 200:
+            return {"data": []}
         return r.json()
     except:
         return {"data": []}
 
-@st.cache_data(ttl=600)
-def search_players(query):
-    if len(query) < 2:
+@st.cache_data(ttl=300)
+def search_players(q):
+    if len(q) < 2:
         return []
-    return api_get("players", {"search": query, "per_page": 25}).get("data", [])
+    return api_get("players", {"search": q, "per_page": 10}).get("data", [])
 
-@st.cache_data(ttl=600)
-def get_player_stats(player_id, n_games=40):
-    data = api_get("stats", {"player_ids[]": player_id, "per_page": n_games}).get("data", [])
+@st.cache_data(ttl=300)
+def get_stats(pid):
+    data = api_get("stats", {"player_ids[]": pid, "per_page": 40}).get("data", [])
     if not data:
         return pd.DataFrame()
     return pd.json_normalize(data)
 
-def get_headshot(player_id):
-    return f"https://balldontlie.io/images/headshots/{player_id}.png"
+def prep(df):
+    cols = {}
+    for s in ["pts","reb","ast","fg3m"]:
+        matches = [c for c in df.columns if c.endswith(f".{s}")]
+        if matches:
+            cols[s] = pd.to_numeric(df[matches[0]], errors="coerce")
+    df2 = pd.DataFrame(cols).dropna()
+    for s in cols:
+        df2[f"{s}_roll"] = df2[s].rolling(5).mean()
+        df2[f"{s}_prev"] = df2[s].shift(1)
+    return df2.dropna()
 
-def preprocess(df):
-    keep = {}
-    for stat in STAT_COLUMNS:
-        cols = [c for c in df.columns if c.split(".")[-1] == stat]
-        if cols:
-            keep[stat] = pd.to_numeric(df[cols[0]], errors="coerce")
-
-    df2 = pd.DataFrame(keep).dropna(how="all")
-    if df2.empty:
-        return df2
-
-    for s in STAT_COLUMNS:
-        if s in df2:
-            df2[f"{s}_roll"] = df2[s].rolling(5).mean()
-            df2[f"{s}_prev"] = df2[s].shift(1)
-
-    df2 = df2.dropna()
-    return df2
-
-# ============================================================
-# MODEL TRAINING
-# ============================================================
-
-def train_models(df):
-    models = {}
-    stds = {}
-
-    features = [c for c in df.columns if ("roll" in c or "prev" in c)]
-    if not features:
-        return {}, {}
-
-    X = df[features].values
-
-    for stat in STAT_COLUMNS:
-        if stat not in df:
+def train(df):
+    feats = [c for c in df.columns if "roll" in c or "prev" in c]
+    models, stds = {}, {}
+    X = df[feats].values
+    for s in ["pts","reb","ast","fg3m"]:
+        if s not in df:
             continue
-        y = df[stat].values
+        y = df[s].values
         if len(y) < 8:
             continue
-
         model = XGBRegressor(
-            n_estimators=300, learning_rate=0.05,
-            max_depth=4, subsample=0.9,
-            colsample_bytree=0.9, objective="reg:squarederror"
+            n_estimators=220, learning_rate=0.05, max_depth=3,
+            subsample=0.9, colsample_bytree=0.9, objective="reg:squarederror"
         )
-        model.fit(X, y)
-
+        model.fit(X,y)
         preds = model.predict(X)
-        stds[stat] = float(np.std(y - preds))
-        models[stat] = (model, features)
-
+        stds[s] = float(np.std(y - preds))
+        models[s] = (model, feats)
     return models, stds
 
-# ============================================================
-# PREDICTION + MONTE CARLO
-# ============================================================
+def predict(models, stds, row):
+    preds, pstd = {}, {}
+    for s,(m,feats) in models.items():
+        X = np.array([row[feats].values], float)
+        mu = float(m.predict(X)[0])
+        preds[s] = max(0, mu)
+        pstd[s] = max(0.5, stds.get(s, 1.0))
+    return preds, pstd
 
-def predict_next(models, stds, row):
-    preds = {}
-    pred_stds = {}
-
-    for stat, (model, features) in models.items():
-        x = np.array([row[features].values], float)
-        mu = float(model.predict(x)[0])
-        preds[stat] = max(0, mu)
-        pred_stds[stat] = max(0.5, stds.get(stat, 1.0))
-
-    return preds, pred_stds
-
-def run_monte(preds, stds):
+def monte(preds, stds, n=4000):
     sims = {}
-    for stat in preds:
-        sims[stat] = np.clip(
-            np.random.normal(preds[stat], stds[stat], DEFAULT_MONTE_CARLO_SIMS),
-            0, None
-        )
+    for s in preds:
+        sims[s] = np.clip(np.random.normal(preds[s], stds[s], n), 0, None)
     return pd.DataFrame(sims)
 
-# ============================================================
-# EDGE + EV
-# ============================================================
+st.markdown("<h2 style='text-align:center;'>ð NBA Luxe Mobile Predictor</h2>", unsafe_allow_html=True)
 
-def american_to_prob(odds):
-    if odds > 0:
-        return 100 / (odds + 100)
-    else:
-        return -odds / (-odds + 100)
+query = st.text_input("Search Player", "")
+players = search_players(query)
 
-def compute_ev(prob, odds):
-    payout = odds/100 if odds > 0 else 100/(-odds)
-    return prob * payout - (1 - prob)
+if not players:
+    st.info("Type at least 2 lettersâ¦")
+else:
+    names = [f"{p['first_name']} {p['last_name']} ({p['team']['abbreviation']})" for p in players]
+    idx = st.selectbox("Select Player", range(len(names)), format_func=lambda i: names[i])
+    p = players[idx]
 
-# ============================================================
-# UI
-# ============================================================
+    st.markdown("<div class='big-card'>", unsafe_allow_html=True)
+    st.image(f"https://balldontlie.io/images/headshots/{p['id']}.png", width=200)
+    st.markdown(f"<h3>{p['first_name']} {p['last_name']}</h3>", unsafe_allow_html=True)
 
-def main():
+    stats = get_stats(p["id"])
+    df = prep(stats)
 
-    st.markdown("<h1 style='text-align:center;'>🏀 NBA Luxe AI Predictor</h1>", unsafe_allow_html=True)
-
-    # PLAYER SEARCH
-    query = st.text_input("Search Player", "")
-    players = search_players(query) if len(query) >= 2 else []
-
-    if players:
-        names = [f"{p['first_name']} {p['last_name']} - {p['team']['abbreviation']}" for p in players]
-        idx = st.selectbox("Select Player", range(len(names)), format_func=lambda x: names[x])
-        player = players[idx]
-    else:
-        st.info("Type at least 2 letters to search.")
-        return
-
-    # IMAGE + INFO
-    colA, colB = st.columns([1,3])
-    with colA:
-        st.image(get_headshot(player["id"]), use_column_width=True)
-    with colB:
-        st.markdown(f"### {player['first_name']} {player['last_name']}")
-        st.markdown(f"Team: **{player['team']['full_name']}**")
-
-    # LOAD STATS
-    df_raw = get_player_stats(player["id"])
-    if df_raw.empty:
-        st.error("No stats available.")
-        return
-
-    df = preprocess(df_raw)
     if df.empty:
-        st.error("Not enough data after preprocessing.")
-        return
+        st.error("Not enough data to model.")
+    else:
+        models, stds = train(df)
+        last = df.iloc[-1]
+        preds, pstd = predict(models, stds, last)
+        sims = monte(preds, pstd)
 
-    models, stds = train_models(df)
-    last_row = df.iloc[-1]
+        col1, col2 = st.columns(2)
+        col1.markdown(f"""<div class='metric-card'>
+            <div class='metric-value'>{preds['pts']:.1f}</div>
+            <div class='metric-label'>Points</div>
+        </div>""", unsafe_allow_html=True)
 
-    preds, pred_stds = predict_next(models, stds, last_row)
-    sims = run_monte(preds, pred_stds)
+        col2.markdown(f"""<div class='metric-card'>
+            <div class='metric-value'>{preds['reb']:.1f}</div>
+            <div class='metric-label'>Rebounds</div>
+        </div>""", unsafe_allow_html=True)
 
-    # METRICS
-    st.markdown("## 🔮 Core Projection")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("PTS", f"{preds['pts']:.1f}")
-    c2.metric("REB", f"{preds['reb']:.1f}")
-    c3.metric("AST", f"{preds['ast']:.1f}")
-    c4.metric("3PM", f"{preds['fg3m']:.1f}")
+        col3, col4 = st.columns(2)
+        col3.markdown(f"""<div class='metric-card'>
+            <div class='metric-value'>{preds['ast']:.1f}</div>
+            <div class='metric-label'>Assists</div>
+        </div>""", unsafe_allow_html=True)
 
-    # PROP INPUTS
-    st.markdown("## 📊 Prop Lines (Enter Book Numbers)")
-    colp1, colp2, colp3, colp4 = st.columns(4)
+        col4.markdown(f"""<div class='metric-card'>
+            <div class='metric-value'>{preds['fg3m']:.1f}</div>
+            <div class='metric-label'>3PM</div>
+        </div>""", unsafe_allow_html=True)
 
-    line_pts = colp1.number_input("PTS Line", value=float(round(preds["pts"],1)))
-    odds_pts = colp1.number_input("Odds (PTS)", value=-110)
+        st.subheader("Prop Probability Checker")
+        stat = st.selectbox("Choose Stat", ["pts","reb","ast","fg3m"])
+        line = st.number_input("Line", value=float(round(preds[stat],1)))
+        prob = float(np.mean(sims[stat] > line))
+        st.markdown(f"<h3 style='text-align:center;'>ð Probability Over: {prob:.1%}</h3>", unsafe_allow_html=True)
 
-    line_reb = colp2.number_input("REB Line", value=float(round(preds["reb"],1)))
-    odds_reb = colp2.number_input("Odds (REB)", value=-110)
-
-    line_ast = colp3.number_input("AST Line", value=float(round(preds["ast"],1)))
-    odds_ast = colp3.number_input("Odds (AST)", value=-110)
-
-    line_3pm = colp4.number_input("3PM Line", value=float(round(preds["fg3m"],1)))
-    odds_3pm = colp4.number_input("Odds (3PM)", value=-110)
-
-    # COMPUTE PROBS
-    st.markdown("## 🎲 Monte Carlo Probabilities + EV")
-
-    results = []
-    for stat, line, odds in [
-        ("pts", line_pts, odds_pts),
-        ("reb", line_reb, odds_reb),
-        ("ast", line_ast, odds_ast),
-        ("fg3m", line_3pm, odds_3pm),
-    ]:
-        prob_over = np.mean(sims[stat] > line)
-        imp = american_to_prob(odds)
-        edge = prob_over - imp
-        ev = compute_ev(prob_over, odds)
-
-        results.append([stat.upper(), f"{prob_over:.3f}", f"{edge:.3f}", f"{ev:.3f}"])
-
-    st.dataframe(pd.DataFrame(results, columns=["Prop","Prob Over","Edge","EV"]), use_container_width=True)
-
-    # DISTRIBUTION VISUAL
-    st.markdown("## 📈 Distribution Viewer")
-    chosen = st.selectbox("Select Stat", STAT_COLUMNS)
-    st.bar_chart(sims[chosen])
-
-if __name__ == "__main__":
-    main()
+    st.markdown("</div>", unsafe_allow_html=True)
