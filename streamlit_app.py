@@ -1,112 +1,164 @@
-# app.py
+# app
 import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import altair as alt
-from datetime import datetime
 from xgboost import XGBRegressor
+import altair as alt
 
 # -------------------------------------------------------------------
 # CONFIG
 # -------------------------------------------------------------------
 API_KEY = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"
 BASE_URL = "https://api.balldontlie.io/v1"
-HEADERS = {"Authorization": f"Bearer {API_KEY}"}
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}"
+}
 
 st.set_page_config(page_title="NBA AI Predictor", layout="wide")
 
-# -------------------------------------------------------------------
-# GLOBAL CSS (mobile-friendly spacing, stacked columns on small screens)
-# -------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-      /* tighter top spacing, better mobile tap targets */
-      .block-container {padding-top: 1rem; padding-bottom: 2rem; max-width: 1200px;}
-      .stMetric {border-radius: 12px; border: 1px solid rgba(0,0,0,0.08); padding: 0.6rem;}
-      /* stack columns under ~800px */
-      @media (max-width: 820px) {
-        .st-emotion-cache-0 {display: block !important;}
-      }
-      /* card-like sections */
-      .card {border: 1px solid rgba(0,0,0,0.08); border-radius: 14px; padding: 1rem; background: white;}
-      .subtle {color: #666;}
-      .page-title {text-align:center; margin: 0.2rem 0 1rem 0;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
 # -------------------------------------------------------------------
-# CACHED REQUEST FUNCTION
+# CACHED REQUEST FUNCTION (Prevents Rate Limits)
 # -------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=300)
 def fetch(endpoint: str, params: dict | None = None) -> dict:
-    """HTTP GET to BallDontLie with basic error wrapping."""
+    """Perform a GET request to the BallDontLie API with caching.
+
+    Parameters
+    ----------
+    endpoint : str
+        The API endpoint (e.g. "players", "stats").
+    params : dict | None
+        Query string parameters for the request.
+
+    Returns
+    -------
+    dict
+        The JSON response parsed into a dictionary. If an error occurs,
+        returns a dict with an "error" key.
+    """
     try:
-        r = requests.get(f"{BASE_URL}/{endpoint}", params=params, headers=HEADERS, timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/{endpoint}",
+            params=params,
+            headers=HEADERS,
+            timeout=8
+        )
         r.raise_for_status()
         return r.json()
-    except Exception as e:  # why: keep UI alive when API blips
+    except Exception as e:
         return {"error": str(e), "data": []}
+
 
 # -------------------------------------------------------------------
 # PLAYER SEARCH
 # -------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=300)
 def get_player_id(name: str) -> tuple[int | None, dict | None]:
+    """Retrieve a player's ID by searching their name.
+
+    Parameters
+    ----------
+    name : str
+        The full or partial name of the player.
+
+    Returns
+    -------
+    tuple
+        A tuple containing the player's ID and the raw player
+        information dict. Returns (None, None) if no player is found.
+    """
     params = {"search": name, "per_page": 50, "page": 1}
     data = fetch("players", params)
-    if "data" in data and data["data"]:
+
+    if "data" in data and len(data["data"]) > 0:
         p = data["data"][0]
         return p["id"], p
     return None, None
 
+
 # -------------------------------------------------------------------
-# STATS FETCH (LAST 30 GAMES)
+# STATS FETCH (Last 30 Games)
 # -------------------------------------------------------------------
 @st.cache_data(show_spinner=False, ttl=300)
 def get_recent_stats(player_id: int) -> pd.DataFrame:
-    stats = fetch("stats", {"player_ids[]": player_id, "per_page": 30})
-    if "data" not in stats or not stats["data"]:
-        return pd.DataFrame()
-    return pd.DataFrame(stats["data"])
+    """Fetch the last 30 games of basic stats for a given player.
 
-# -------------------------------------------------------------------
-# HEADSHOT URL
-# -------------------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=86400)
-def get_headshot_url(player_id: int, first: str, last: str) -> str:
+    Parameters
+    ----------
+    player_id : int
+        The BallDontLie player ID.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame containing the last 30 game logs with columns for
+        points, assists and rebounds. Returns an empty DataFrame on
+        error or if no data is found.
     """
-    Prefer BallDontLie CDN headshot by player_id.
-    Fallback to initials avatar to avoid broken images.
-    """
-    primary = f"https://cdn.balldontlie.io/images/headshots/{player_id}.png?width=260"
-    try:
-        # light check; why: avoid showing broken image boxes
-        r = requests.head(primary, timeout=5)
-        if r.ok:
-            return primary
-    except Exception:
-        pass
-    initials_seed = requests.utils.quote(f"{first} {last}")
-    return f"https://api.dicebear.com/7.x/initials/png?seed={initials_seed}&backgroundType=gradientLinear"
+    stats = fetch(
+        "stats",
+        {"player_ids[]": player_id, "per_page": 30}
+    )
+
+    if "data" not in stats or len(stats["data"]) == 0:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(stats["data"])
+    # Only keep the columns we care about. The API returns nested
+    # dictionaries for player and team; we extract numeric stats only.
+    return df[["pts", "ast", "reb"]].copy()
+
 
 # -------------------------------------------------------------------
 # FEATURE ENGINEERING
 # -------------------------------------------------------------------
 def prepare_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute rolling means for points, assists and rebounds.
+
+    The model uses a 5‑game rolling average for each stat to predict
+    the next game’s performance. Rows with insufficient history are
+    dropped.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        DataFrame with columns "pts", "ast", and "reb".
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with added columns "pts_roll", "ast_roll", "reb_roll"
+        and dropped NaNs.
+    """
     df = df.copy()
     df["pts_roll"] = df["pts"].rolling(5).mean()
     df["ast_roll"] = df["ast"].rolling(5).mean()
     df["reb_roll"] = df["reb"].rolling(5).mean()
-    return df.dropna()
+    df = df.dropna()
+    return df
+
 
 # -------------------------------------------------------------------
-# MODEL
+# TRAIN XGBOOST MODEL
 # -------------------------------------------------------------------
 def train_model(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
+    """Train a lightweight XGBoost regressor on the provided data.
+
+    Parameters
+    ----------
+    X : pandas.DataFrame
+        Feature matrix.
+    y : pandas.Series
+        Target variable.
+
+    Returns
+    -------
+    XGBRegressor
+        A trained XGBoost model.
+    """
     model = XGBRegressor(
         n_estimators=250,
         learning_rate=0.05,
@@ -115,198 +167,269 @@ def train_model(X: pd.DataFrame, y: pd.Series) -> XGBRegressor:
         colsample_bytree=0.9,
         objective="reg:squarederror",
         n_jobs=2,
-        random_state=42,
     )
     model.fit(X, y)
     return model
 
-# -------------------------------------------------------------------
-# FLATTEN STATS
-# -------------------------------------------------------------------
-def flatten_stats(df_raw: pd.DataFrame) -> pd.DataFrame:
-    """Extracts game metadata and ensures types."""
-    df = df_raw.copy()
-    # Nested fields may be dicts; guard missing keys
-    df["game_date"] = pd.to_datetime(df["game"].apply(lambda g: g.get("date") if isinstance(g, dict) else None))
-    df["game_id"] = df["game"].apply(lambda g: g.get("id") if isinstance(g, dict) else None)
-    df["team_abbr"] = df["team"].apply(lambda t: t.get("abbreviation") if isinstance(t, dict) else None)
-    # Ensure numeric
-    for col in ["pts", "ast", "reb"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["game_date"])
-    df = df.sort_values("game_date").reset_index(drop=True)
-    return df
 
 # -------------------------------------------------------------------
-# CHARTS
+# PROBABILITY CALCULATION
 # -------------------------------------------------------------------
-def bar_last_10(df: pd.DataFrame) -> alt.Chart:
-    """Grouped bars for last 10 games across PTS/AST/REB."""
-    df10 = df.tail(10)[["game_date", "pts", "ast", "reb"]].copy()
-    melted = df10.melt(id_vars="game_date", var_name="Stat", value_name="Value")
-    return (
-        alt.Chart(melted)
-        .mark_bar()
-        .encode(
-            x=alt.X("yearmonthdate(game_date):T", title="Game"),
-            xOffset=alt.XOffset("Stat:N"),
-            y=alt.Y("Value:Q", title=""),
-            color=alt.Color("Stat:N", legend=alt.Legend(orient="top")),
-            tooltip=[
-                alt.Tooltip("yearmonthdate(game_date):T", title="Game"),
-                alt.Tooltip("Stat:N"),
-                alt.Tooltip("Value:Q"),
-            ],
-        )
-        .properties(height=320)
-        .interactive()
+def compute_threshold_probability(values: pd.Series, threshold: float) -> float:
+    """Compute the probability that a stat meets or exceeds a given threshold.
+
+    This helper calculates the fraction of historical observations in
+    `values` that are greater than or equal to `threshold`. If no
+    observations are present, returns 0.0.
+
+    Parameters
+    ----------
+    values : pandas.Series
+        Historical observations of a given stat.
+    threshold : float
+        The user‑defined threshold to evaluate.
+
+    Returns
+    -------
+    float
+        The estimated probability (between 0 and 1).
+    """
+    if len(values) == 0:
+        return 0.0
+    return float((values >= threshold).mean())
+
+
+# -------------------------------------------------------------------
+# TRENDING MESSAGE
+# -------------------------------------------------------------------
+def get_trend_message(predicted: float, mean: float, recent_mean: float) -> str:
+    """Generate a human‑readable trend message.
+
+    Compares the predicted value against the overall mean and the last
+    five‑game mean to indicate whether a player is trending up or
+    down. The thresholds are heuristic; adjust as desired.
+
+    Parameters
+    ----------
+    predicted : float
+        The model’s predicted value for the next game.
+    mean : float
+        The mean of the last 30 games.
+    recent_mean : float
+        The mean of the last five games.
+
+    Returns
+    -------
+    str
+        A descriptive message about the trend.
+    """
+    diff_mean = predicted - mean
+    diff_recent = predicted - recent_mean
+
+    # Determine the trend direction and magnitude
+    def classify(diff: float) -> str:
+        if abs(diff) < 1.0:
+            return "around his average"
+        if diff > 0:
+            return "upward"
+        return "downward"
+
+    parts = []
+    # Compare to overall mean
+    if abs(diff_mean) >= 1.0:
+        direction = "higher" if diff_mean > 0 else "lower"
+        parts.append(f"{abs(diff_mean):.1f} {direction} than his 30‑game average")
+    # Compare to recent mean
+    if abs(diff_recent) >= 1.0:
+        direction = "higher" if diff_recent > 0 else "lower"
+        parts.append(f"{abs(diff_recent):.1f} {direction} than his last 5‑game average")
+
+    if not parts:
+        return "This prediction is roughly in line with recent performance."
+    return "; ".join(parts) + "."
+
+
+# -------------------------------------------------------------------
+# CHART GENERATOR
+# -------------------------------------------------------------------
+def build_distribution_chart(values: pd.Series, predicted_value: float, threshold: float, stat_name: str) -> alt.Chart:
+    """Create a histogram with overlay lines for prediction and threshold.
+
+    Parameters
+    ----------
+    values : pandas.Series
+        Historical observations for a given statistic.
+    predicted_value : float
+        The model’s predicted value for the next game.
+    threshold : float
+        The user‑selected threshold to evaluate.
+    stat_name : str
+        The name of the statistic (e.g. "Points").
+
+    Returns
+    -------
+    altair.Chart
+        An Altair chart object rendering the distribution, prediction line
+        and threshold line.
+    """
+    # Prepare a DataFrame for Altair
+    data = pd.DataFrame({"value": values})
+    base = alt.Chart(data).mark_bar(opacity=0.6).encode(
+        x=alt.X("value:Q", bin=alt.Bin(maxbins=20), title=f"{stat_name} (last 30 games)"),
+        y=alt.Y('count()', title='Frequency'),
     )
 
-def bar_rolling_vs_avg(df: pd.DataFrame) -> alt.Chart:
-    """5-game rolling avg vs overall avg bars."""
-    recent = df.tail(5)[["pts", "ast", "reb"]].mean()
-    overall = df[["pts", "ast", "reb"]].mean()
-    comp = pd.DataFrame(
-        {
-            "Stat": ["PTS", "AST", "REB", "PTS", "AST", "REB"],
-            "Window": ["Last 5"] * 3 + ["Overall"] * 3,
-            "Value": [recent["pts"], recent["ast"], recent["reb"], overall["pts"], overall["ast"], overall["reb"]],
-        }
-    )
-    return (
-        alt.Chart(comp)
-        .mark_bar()
-        .encode(
-            x=alt.X("Stat:N", title=""),
-            xOffset=alt.XOffset("Window:N"),
-            y=alt.Y("Value:Q", title="Average"),
-            color=alt.Color("Window:N", legend=alt.Legend(orient="top")),
-            tooltip=[alt.Tooltip("Window:N"), alt.Tooltip("Stat:N"), alt.Tooltip("Value:Q")],
-        )
-        .properties(height=320)
-        .interactive()
+    # Prediction line
+    pred_line = alt.Chart(pd.DataFrame({'x': [predicted_value]})).mark_rule(color='blue').encode(x='x:Q').properties(
+        title=f"Distribution of {stat_name}"
     )
 
-# -------------------------------------------------------------------
-# UI
-# -------------------------------------------------------------------
-st.markdown("<h1 class='page-title'>🏀 NBA AI Predictor</h1>", unsafe_allow_html=True)
-st.caption("30-Game Rolling XGBoost • Data by BallDontLie")
+    # Threshold line
+    thresh_line = alt.Chart(pd.DataFrame({'x': [threshold]})).mark_rule(color='orange', strokeDash=[4,2]).encode(x='x:Q')
 
-colA, colB = st.columns([3, 1])
-with colA:
-    player_name = st.text_input("Search player", placeholder="e.g., Luka Doncic", label_visibility="collapsed")
-with colB:
-    compact = st.toggle("Compact (mobile) mode", value=True)
+    return (base + pred_line + thresh_line).configure_axis(labelFontSize=11, titleFontSize=13)
+
+
+# -------------------------------------------------------------------
+# MAIN STREAMLIT APP
+# -------------------------------------------------------------------
+st.markdown(
+    """
+    <h1 style='text-align:center;'>🏀 NBA AI Predictor</h1>
+    <p style='text-align:center;'>Enhanced Rolling XGBoost Model with Prop Insights</p>
+    """,
+    unsafe_allow_html=True,
+)
+
+player_name = st.text_input("Enter NBA Player Name", "", key="player_input")
 
 if player_name:
+    st.write(" ")
+
+    # ---------------------------------------------------------------
+    # SEARCH PLAYER
+    # ---------------------------------------------------------------
     with st.spinner("Searching player…"):
         player_id, player_info = get_player_id(player_name)
 
-    if not player_id or not player_info:
+    if not player_id:
         st.error("❌ Player not found. Try full names (e.g., 'Luka Doncic').")
         st.stop()
 
-    with st.spinner("Loading last 30 games…"):
-        df_raw = get_recent_stats(player_id)
+    st.subheader(f"📌 {player_info['first_name']} {player_info['last_name']}")
 
-    if df_raw.empty:
+    # ---------------------------------------------------------------
+    # FETCH STATS
+    # ---------------------------------------------------------------
+    with st.spinner("Loading last 30 games…"):
+        raw_df = get_recent_stats(player_id)
+
+    if raw_df.empty:
         st.error("❌ No recent stats found for this player.")
         st.stop()
 
-    df = flatten_stats(df_raw)
-    if df[["pts", "ast", "reb"]].dropna().shape[0] < 6:
+    # Keep copy for probability calculations
+    hist_df = raw_df.copy()
+
+    # Prepare features for modelling
+    df = prepare_features(raw_df)
+    if df.empty:
         st.error("❌ Not enough data for model (need 5+ games).")
         st.stop()
 
-    # Headshot + Bio card
-    headshot = get_headshot_url(player_id, player_info["first_name"], player_info["last_name"])
-    team = player_info.get("team", {}) or {}
-    pos = (player_info.get("position") or "").strip() or "—"
+    # ML Inputs
+    X = df[["pts_roll", "ast_roll", "reb_roll"]]
 
-    # Averages
-    last10 = df.tail(10)[["pts", "ast", "reb"]].mean()
-    last30 = df[["pts", "ast", "reb"]].mean()
+    # Train models
+    pts_model = train_model(X, df["pts"])
+    ast_model = train_model(X, df["ast"])
+    reb_model = train_model(X, df["reb"])
 
-    # Layout: compact stacks; otherwise two columns
-    if compact:
-        c_img = st.container()
-        with c_img:
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.image(headshot, width=180)
-            st.subheader(f"{player_info['first_name']} {player_info['last_name']}")
-            st.caption(f"{team.get('full_name','')} • {pos}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("PTS (10)", f"{last10['pts']:.1f}")
-            c2.metric("AST (10)", f"{last10['ast']:.1f}")
-            c3.metric("REB (10)", f"{last10['reb']:.1f}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("PTS (30)", f"{last30['pts']:.1f}")
-            c2.metric("AST (30)", f"{last30['ast']:.1f}")
-            c3.metric("REB (30)", f"{last30['reb']:.1f}")
-            st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        left, right = st.columns([1, 2])
-        with left:
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            st.image(headshot, width=200)
-            st.subheader(f"{player_info['first_name']} {player_info['last_name']}")
-            st.caption(f"{team.get('full_name','')} • {pos}")
-            st.markdown("</div>", unsafe_allow_html=True)
-        with right:
-            st.markdown("<div class='card'>", unsafe_allow_html=True)
-            r1, r2, r3 = st.columns(3)
-            r1.metric("PTS (10)", f"{last10['pts']:.1f}")
-            r2.metric("AST (10)", f"{last10['ast']:.1f}")
-            r3.metric("REB (10)", f"{last10['reb']:.1f}")
-            r1, r2, r3 = st.columns(3)
-            r1.metric("PTS (30)", f"{last30['pts']:.1f}")
-            r2.metric("AST (30)", f"{last30['ast']:.1f}")
-            r3.metric("REB (30)", f"{last30['reb']:.1f}")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-    # Features + Model
-    df_feats = prepare_features(df[["pts", "ast", "reb"]].copy())
-    X = df_feats[["pts_roll", "ast_roll", "reb_roll"]]
-    pts_model = train_model(X, df_feats["pts"])
-    ast_model = train_model(X, df_feats["ast"])
-    reb_model = train_model(X, df_feats["reb"])
-    latest = X.iloc[[-1]]
-
+    # Latest row for prediction
+    latest = X.iloc[-1:]
     pred_pts = float(pts_model.predict(latest)[0])
     pred_ast = float(ast_model.predict(latest)[0])
     pred_reb = float(reb_model.predict(latest)[0])
 
-    st.markdown("### 🔮 Predicted Next Game")
-    if compact:
-        m1 = st.container()
-        with m1:
-            a, b, c = st.columns(3)
-            a.metric("Points", f"{pred_pts:.1f}")
-            b.metric("Assists", f"{pred_ast:.1f}")
-            c.metric("Rebounds", f"{pred_reb:.1f}")
-    else:
-        a, b, c = st.columns(3)
-        a.metric("Points", f"{pred_pts:.1f}")
-        b.metric("Assists", f"{pred_ast:.1f}")
-        c.metric("Rebounds", f"{pred_reb:.1f}")
+    # Historical means for trend analysis
+    overall_means = hist_df.mean()
+    recent_means = hist_df.tail(5).mean()
+
+    # User threshold inputs
+    st.markdown("## 🎯 Set Your Prop Lines")
+    cols_thresholds = st.columns(3)
+    # Determine reasonable slider ranges based on historical data
+    # Use the min and max observed values with some padding
+    pts_min, pts_max = hist_df["pts"].min(), hist_df["pts"].max()
+    ast_min, ast_max = hist_df["ast"].min(), hist_df["ast"].max()
+    reb_min, reb_max = hist_df["reb"].min(), hist_df["reb"].max()
+
+    with cols_thresholds[0]:
+        pts_threshold = st.slider(
+            "Points Line", min_value=float(max(0, pts_min - 5)), max_value=float(pts_max + 5),
+            value=float(round(pred_pts)), step=0.5, key="pts_threshold"
+        )
+    with cols_thresholds[1]:
+        ast_threshold = st.slider(
+            "Assists Line", min_value=float(max(0, ast_min - 2)), max_value=float(ast_max + 2),
+            value=float(round(pred_ast, 1)), step=0.5, key="ast_threshold"
+        )
+    with cols_thresholds[2]:
+        reb_threshold = st.slider(
+            "Rebounds Line", min_value=float(max(0, reb_min - 2)), max_value=float(reb_max + 2),
+            value=float(round(pred_reb, 1)), step=0.5, key="reb_threshold"
+        )
+
+    # Compute probabilities
+    prob_pts = compute_threshold_probability(hist_df["pts"], pts_threshold)
+    prob_ast = compute_threshold_probability(hist_df["ast"], ast_threshold)
+    prob_reb = compute_threshold_probability(hist_df["reb"], reb_threshold)
+
+    # ---------------------------------------------------------------
+    # OUTPUT: Predictions & Probabilities
+    # ---------------------------------------------------------------
+    st.markdown("## 🔮 Predicted Next Game Stats")
+    c_pred = st.columns(3)
+    c_pred[0].metric("Points", f"{pred_pts:.1f}", help=get_trend_message(pred_pts, overall_means["pts"], recent_means["pts"]))
+    c_pred[1].metric("Assists", f"{pred_ast:.1f}", help=get_trend_message(pred_ast, overall_means["ast"], recent_means["ast"]))
+    c_pred[2].metric("Rebounds", f"{pred_reb:.1f}", help=get_trend_message(pred_reb, overall_means["reb"], recent_means["reb"]))
+
+    st.markdown("## 📊 Probability of Clearing Your Line")
+    c_prob = st.columns(3)
+    c_prob[0].metric("P(Points ≥ Line)", f"{prob_pts*100:.0f}%")
+    c_prob[1].metric("P(Assists ≥ Line)", f"{prob_ast*100:.0f}%")
+    c_prob[2].metric("P(Rebounds ≥ Line)", f"{prob_reb*100:.0f}%")
 
     st.markdown("---")
+    st.markdown("### 📈 Recent Trends")
+    # Show last 10 games trends for basic stats
+    st.line_chart(hist_df[["pts", "ast", "reb"]].tail(10))
 
-    # Charts: Professional bar graphs
-    st.markdown("### 📊 Last 10 Games (Grouped Bars)")
-    st.altair_chart(bar_last_10(df), use_container_width=True)
-
-    st.markdown("### 📊 Rolling vs Overall Averages")
-    st.altair_chart(bar_rolling_vs_avg(df), use_container_width=True)
-
-    # Data tools
-    with st.expander("🔧 Model Inputs (latest row)"):
-        st.dataframe(latest, use_container_width=True)
-    csv = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download last 30 games (CSV)",
-        data=csv,
-        file_name=f"{player_info['first_name']}_{player_info['last_name']}_last30.csv",
-        mime="text/csv",
+    # Summarise last five games vs 30 game means
+    st.markdown("### 📋 Averages Comparison")
+    comparison_data = pd.DataFrame({
+        "Stat": ["Points", "Assists", "Rebounds"],
+        "30‑Game Avg": [overall_means["pts"], overall_means["ast"], overall_means["reb"]],
+        "Last 5 Avg": [recent_means["pts"], recent_means["ast"], recent_means["reb"]],
+        "Prediction": [pred_pts, pred_ast, pred_reb],
+    })
+    st.dataframe(
+        comparison_data.set_index("Stat").style.format("{:.1f}"),
+        use_container_width=True,
     )
+
+    st.markdown("### 🧮 Distributions and Lines")
+    # Display distribution charts for each stat
+    dist_cols = st.columns(3)
+    with dist_cols[0]:
+        chart = build_distribution_chart(hist_df["pts"], pred_pts, pts_threshold, "Points")
+        st.altair_chart(chart, use_container_width=True)
+    with dist_cols[1]:
+        chart = build_distribution_chart(hist_df["ast"], pred_ast, ast_threshold, "Assists")
+        st.altair_chart(chart, use_container_width=True)
+    with dist_cols[2]:
+        chart = build_distribution_chart(hist_df["reb"], pred_reb, reb_threshold, "Rebounds")
+        st.altair_chart(chart, use_container_width=True)
+
+    st.markdown("### 📊 Model Inputs (Latest Row)")
+    st.dataframe(latest, use_container_width=True)
