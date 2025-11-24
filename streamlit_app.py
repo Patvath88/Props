@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -71,7 +72,7 @@ class BdlClient:
         self._attach_auth_headers()
 
     def _attach_auth_headers(self) -> None:
-        # Why: support provider variations without exposing the key value.
+        # Why: support provider variations.
         if not self.api_key:
             return
         self.sess.headers.update(
@@ -84,7 +85,8 @@ class BdlClient:
 
     def _get(self, path: str, params: Dict) -> Dict:
         try:
-            r = self.sess.get(f"{self.base}/{path}", params=params, timeout=30)
+            # ↓ fail fast to avoid startup hang
+            r = self.sess.get(f"{self.base}/{path}", params=params, timeout=8)
             r.raise_for_status()
             return r.json()
         except requests.HTTPError as e:
@@ -324,7 +326,7 @@ def train_ridge_or_wma(X: pd.DataFrame, y: pd.Series) -> Tuple[Optional[Pipeline
     model.fit(X, y)
     yhat = model.predict(X)
     residuals = y.values - yhat
-    return model, float(yhat[-1]), residuals  # last in-sample approximation
+    return model, float(yhat[-1]), residuals
 
 
 def home_away_multiplier(df: pd.DataFrame, prop: str) -> Optional[float]:
@@ -360,16 +362,33 @@ def project_next(
 st.set_page_config(page_title="NBA Player Props Projector", layout="wide")
 st.title("🏀 NBA Player Props Projector")
 
-# Secure API key handling (sidebar + secrets + env)
+# Secure API key handling
 default_key = st.secrets.get("balldontlie_api_key", os.getenv("BALDONTLIE_API_KEY", ""))
 api_key = st.sidebar.text_input(
     "balldontlie API Key (All-Star tier)",
     value=default_key,
     type="password",
-    help="Use st.secrets['balldontlie_api_key'] or env BALDONTLIE_API_KEY for unattended runs.",
+    help="You can also set st.secrets['balldontlie_api_key'] or env BALDONTLIE_API_KEY.",
 )
 if not api_key:
-    st.warning("Enter your balldontlie API key to unlock full stats.")
+    st.info("Enter your balldontlie API key (All-Star tier) to enable API calls.")
+
+# --- Diagnostics (optional but handy if cloud stalls) ---
+with st.sidebar.expander("Diagnostics"):
+    if st.button("Ping API (teams)"):
+        try:
+            t0 = time.perf_counter()
+            client = BdlClient(api_key=api_key)
+            r = client.sess.get(f"{BALDONTLIE_BASE}/teams", timeout=8)
+            dt_ms = int((time.perf_counter() - t0) * 1000)
+            st.write({"status": r.status_code, "elapsed_ms": dt_ms, "len": len(r.text)})
+            if r.status_code != 200:
+                st.error(r.text[:500])
+        except Exception as e:
+            st.error(str(e))
+    if st.button("Clear cache"):
+        st.cache_data.clear()
+        st.success("Cache cleared.")
 
 st.sidebar.header("Controls")
 season_current = TODAY.year if TODAY.month >= 10 else TODAY.year - 1
@@ -391,12 +410,8 @@ st.sidebar.markdown("---")
 player_query = st.sidebar.text_input("Search player", value="")
 search_btn = st.sidebar.button("Search")
 
-# Data
-try:
-    teams_df = cached_teams_df(api_key)
-except Exception as e:
-    st.error(f"Failed to load teams. {e}")
-    teams_df = pd.DataFrame()
+# NOTE: We DO NOT load teams on startup anymore (avoids cloud hang).
+teams_df = pd.DataFrame()
 
 drtg_map: Dict[str, float] = {}
 if drtg_file is not None:
@@ -453,8 +468,15 @@ if player_query.strip():
 
     games_df = build_game_table(stats_raw)
 
+    # Lazy-load teams now (only when needed)
+    try:
+        teams_df = cached_teams_df(api_key)
+    except Exception as e:
+        st.warning(f"Could not load teams for opponent lookup. {e}")
+        teams_df = pd.DataFrame()
+
     opp_id, opp_abbr, game_date, is_home_next = (None, None, None, None)
-    if player_team_id:
+    if player_team_id and not teams_df.empty:
         try:
             opp_id, opp_abbr, game_date, is_home_next = find_next_opponent(player_team_id, teams_df, api_key)
         except Exception as e:
