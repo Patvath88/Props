@@ -218,7 +218,7 @@ if not opp_abbr:
 def_rtg, league_avg = load_def_ratings()
 opp_drtg = def_rtg.get(opp_abbr, league_avg)
 
-st.markdown(f"**Next Opponent:** {opp_abbr}) 
+st.markdown **Next Opponent:** {opp_abbr}
 **Opponent Defensive Rating:** `{opp_drtg}`  
 **League Avg DRTG:** `{league_avg:.1f}`")
 
